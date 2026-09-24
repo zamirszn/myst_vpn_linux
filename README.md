@@ -451,6 +451,28 @@ sudo nft delete table inet myst_killswitch
 leave you without a network. `myst status` reports whether it is armed; disable
 it with `mystd -no-killswitch`.
 
+**Verified blocking, both directions.** Tested on a live kernel (Ubuntu 6.11) on
+2026-09-24. The destination and the route to it were held constant across every
+phase — the LAN gateway at `10.0.0.1`, which leaves via the local subnet route on
+the physical device and so never enters the tunnel. The filter is therefore the
+only thing in a position to drop it:
+
+| Phase | Route to `10.0.0.1` | Public IP | Ping to gateway |
+| --- | --- | --- | --- |
+| disconnected | `dev wlo1` | `143.105.112.35` | 0% loss |
+| connected, filter armed | `dev wlo1` | `176.241.28.114` (HU) | **100% loss** |
+| disconnected | `dev wlo1` | `143.105.112.35` | 0% loss |
+
+The middle row is the one that matters, and the control alongside it is what
+makes it unambiguous: while the gateway was unreachable, a public-IP lookup
+*through the tunnel* still answered. The machine had working internet — it simply
+could not send anything outside the tunnel. That is precisely the leak this
+exists to prevent, now observed rather than assumed.
+
+The endpoint exemption is load-bearing in that result. The handshake that brought
+the tunnel up had to traverse the armed filter, because the filter goes in first —
+so the exemption is not theoretical either.
+
 **What it does not cover.** It filters the *output* hook, so it governs traffic
 originating on this host. Traffic forwarded on behalf of containers does not
 traverse that hook and is **not** filtered — with Docker running, container
@@ -542,17 +564,12 @@ forwarded traffic — containers, VMs on a bridge — is not covered. Closing th
 means adding a forward chain, which risks breaking Docker's networking and has
 not been attempted here.
 
-**The kill switch loads, but its blocking has never been provoked.** Verified on
-a live kernel (Ubuntu, 6.11) on 2026-09-24: `myst connect` arms the table, the
-tunnel establishes with the endpoint still reachable *through* the filter, and
-`myst disconnect` removes the table — leaving the public IP back at its
-pre-connect value and DNS working. That covers installation, the endpoint
-exemption, and teardown.
-
-What that does **not** cover is the case the switch exists for. The tunnel was
-never dropped while the switch was armed, so the `counter drop` rule has not been
-observed dropping a packet. "It loads and does not break the tunnel" is a
-different claim from "it blocks the leak", and only the first has been shown.
+**The kill switch has never been exercised by a real drop.** Its blocking is
+verified — see the table above — but every test so far has ended with a
+deliberate `myst disconnect`. A tunnel that dies *on its own*, from a wifi change
+or a suspend or a node restarting, is a different path, and it is the one the
+health monitor exists to handle. The monitor is covered by unit tests; it has not
+yet been watched through a real drop on a live tunnel.
 
 **The tray needs a StatusNotifier host.** On GNOME that means the AppIndicator
 extension; without it the applet exits with an explanation rather than running
