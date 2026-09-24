@@ -4,6 +4,9 @@
 tokens.json
 token-from-browser.json
 proxy-config.json
+wireguard-config.json
+router.conf
+*.conf
 requests.ndjson
 magic-code.txt
 profile/
