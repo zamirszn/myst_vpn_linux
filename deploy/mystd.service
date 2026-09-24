@@ -1,0 +1,39 @@
+[Unit]
+Description=Mysterium VPN daemon
+Documentation=https://github.com/zamirszn/mysterium-linux-client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mystd
+Restart=on-failure
+RestartSec=5
+
+# A system service, not a --user one: it must survive desktop logout, and it
+# needs root for the TUN device and the routing table in any case.
+#
+# Hardening below is deliberately moderate. wg-quick shells out to ip, wg, and
+# sysctl, and writes DNS configuration; tightening this further (ProtectSystem=
+# strict, ProtectKernelTunables=yes) breaks the tunnel. These settings have NOT
+# been validated against a real wg-quick run — treat them as a starting point.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+
+# wg-quick writes the interface config, and the generated config holds a private
+# key, so /etc/wireguard and the state directory must stay writable.
+ReadWritePaths=/etc/wireguard /etc/resolv.conf /var/lib/mystd /run/mystd
+
+StateDirectory=mystd
+RuntimeDirectory=mystd
+
+[Install]
+WantedBy=multi-user.target
