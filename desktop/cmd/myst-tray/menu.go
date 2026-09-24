@@ -115,7 +115,7 @@ func (m *menuMethods) Event(id int32, eventID string, data dbus.Variant, timesta
 	case id == idQuit:
 		a.quitNow()
 	case id >= idRegionBase && id < idRegionBase+int32(len(regions)):
-		a.doConnect(regions[id-idRegionBase].code)
+		a.doConnect(regions[id-idRegionBase].Code)
 	}
 	return nil
 }
@@ -153,10 +153,10 @@ func (m *menuMethods) buildLocked() layoutItem {
 	// Region submenu, with the current one checked.
 	sub := layoutItem{ID: idRegion, Properties: submenuProps("Region"), Children: []dbus.Variant{}}
 	for i, r := range regions {
-		props := enabled(r.name, !busy)
+		props := enabled(r.Name, !busy)
 		props["toggle-type"] = dbus.MakeVariant("radio")
 		state := int32(0)
-		if r.code == a.country {
+		if r.Code == a.country {
 			state = 1
 		}
 		props["toggle-state"] = dbus.MakeVariant(state)

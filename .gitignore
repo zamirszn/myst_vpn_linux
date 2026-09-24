@@ -29,6 +29,5 @@ node_modules/
 # ---- build output ----
 /myst
 /mystd
-/tray/myst-tray
-# `go build ./...` inside the tray module names the binary after its directory.
-/tray/tray
+/desktop/myst-tray
+/desktop/myst-gui

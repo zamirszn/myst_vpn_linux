@@ -33,14 +33,14 @@ type fakeClient struct {
 	block chan struct{}
 }
 
-func (f *fakeClient) status(context.Context) (*status, error) {
+func (f *fakeClient) Status(context.Context) (*status, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.statusCalls++
 	return f.statusResp, f.statusErr
 }
 
-func (f *fakeClient) connect(_ context.Context, country, _ string) (*status, error) {
+func (f *fakeClient) Connect(_ context.Context, country, _ string) (*status, error) {
 	f.mu.Lock()
 	f.connectCalls++
 	f.lastCountry = country
@@ -53,7 +53,7 @@ func (f *fakeClient) connect(_ context.Context, country, _ string) (*status, err
 	return f.connectResp, f.connectErr
 }
 
-func (f *fakeClient) disconnect(context.Context) (*status, error) {
+func (f *fakeClient) Disconnect(context.Context) (*status, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.disconnectResp, f.disconnectErr
@@ -295,14 +295,14 @@ func TestMenuChecksTheSelectedRegion(t *testing.T) {
 		props := itemProps(t, root, idRegionBase+int32(i))
 		state, ok := props["toggle-state"].Value().(int32)
 		if !ok {
-			t.Fatalf("region %s has no integer toggle-state", r.code)
+			t.Fatalf("region %s has no integer toggle-state", r.Code)
 		}
 		want := int32(0)
-		if r.code == "de" {
+		if r.Code == "de" {
 			want = 1
 		}
 		if state != want {
-			t.Errorf("region %s toggle-state = %d, want %d", r.code, state, want)
+			t.Errorf("region %s toggle-state = %d, want %d", r.Code, state, want)
 		}
 	}
 }

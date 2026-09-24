@@ -1,27 +1,29 @@
-package main
+// Package regions holds the list of exit countries the desktop front ends
+// offer, and the small formatting helpers that go with it.
+package regions
 
 import (
 	"strings"
 	"unicode"
 )
 
-// region is one entry in the Region submenu.
-type region struct {
-	code string
-	name string
+// Region is one entry in the Region submenu.
+type Region struct {
+	Code string
+	Name string
 }
 
-// regions is a curated set rather than the account's full country list.
+// All is a curated set rather than the account's full country list.
 //
 // The complete list lives behind GET /connection/config, which needs an access
 // token — and the token deliberately belongs to the daemon, not to a desktop
-// applet running as the logged-in user. Fetching it here would mean a second
+// front end running as the logged-in user. Fetching it here would mean a second
 // copy of the credential, so the applet offers the countries people actually
 // pick and accepts any code the user sets with -country.
 //
 // Mysterium accepts country codes it has no nodes for; the connect simply fails
-// and the failure lands in the menu's status line.
-var regions = []region{
+// and the failure lands in the status line.
+var All = []Region{
 	{"us", "United States"},
 	{"gb", "United Kingdom"},
 	{"ca", "Canada"},
@@ -42,24 +44,24 @@ var regions = []region{
 	{"za", "South Africa"},
 }
 
-// regionName turns a country code into something readable. An unknown code is
+// Name turns a country code into something readable. An unknown code is
 // not an error — it may well be a valid country this list does not carry — so
 // it is shown as-is rather than hidden.
-func regionName(code string) string {
+func Name(code string) string {
 	if code == "" {
 		return "the fastest region"
 	}
-	for _, r := range regions {
-		if strings.EqualFold(r.code, code) {
-			return r.name
+	for _, r := range All {
+		if strings.EqualFold(r.Code, code) {
+			return r.Name
 		}
 	}
 	return strings.ToUpper(code)
 }
 
-// titleCase capitalises the first letter of each word, which is all the daemon's
+// TitleCase capitalises the first letter of each word, which is all the daemon's
 // lowercase city names ("gloucester") need.
-func titleCase(s string) string {
+func TitleCase(s string) string {
 	prev := ' '
 	return strings.Map(func(r rune) rune {
 		out := r

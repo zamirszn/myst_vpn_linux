@@ -69,6 +69,22 @@ Add `--json` for the raw status, if you are scripting against it.
 myst disconnect
 ```
 
+### Or use the window
+
+```sh
+myst-gui
+```
+
+A window with the state, a Connect/Disconnect button, a region picker, the exit
+IP with a Copy button, and indicators for IPv6 and the kill switch. It polls the
+daemon every two seconds, so a change made anywhere else — from the CLI, from the
+tray, or by the health monitor repairing a dropped tunnel — shows up there
+within a moment.
+
+Like the tray, it holds no credentials and no privileges. Every action is a
+request over the control socket, so it runs as your user while the only root
+process remains the daemon.
+
 ### Or use the tray
 
 The tray applet is a shield icon that shows the state at a glance:
@@ -83,10 +99,6 @@ The tray applet is a shield icon that shows the state at a glance:
 
 **Left click** connects or disconnects. **Right click** opens a menu with the
 state, Connect/Disconnect, a region submenu, Copy exit IP, and Quit.
-
-It holds no credentials and no privileges — every action is a request over the
-control socket, so it runs as your user while the only root process remains the
-daemon.
 
 To start it with your session, see [The tray applet](#the-tray-applet).
 
@@ -250,19 +262,28 @@ The headless magic-link flow is designed but not built; see
 ## Building from source
 
 The daemon and CLI have **no external dependencies** — Go's standard library
-only. The tray is the one exception and lives in its own module, because a tray
-icon needs a D-Bus library and Go has none.
+only, and they build with Go 1.22. The `desktop/` module is the exception, and
+it is a separate module precisely so that stays true: a tray icon needs a D-Bus
+library, and a window needs GTK.
+
+Building the window also needs the GTK4 development headers, and the current
+gotk4 release requires **Go 1.24 or newer**. The tray alone builds without
+either — it is pure Go and speaks D-Bus directly.
 
 ```sh
+sudo apt install libgtk-4-dev     # only needed for the window
+
 # daemon and CLI
 go build -o mystd ./cmd/mystd
 go build -o myst  ./cmd/myst
 
-# tray applet
-(cd tray && go build -o myst-tray .)
+# desktop front ends — the tray applet and the GTK window
+(cd desktop && go build -o myst-tray ./cmd/myst-tray)
+(cd desktop && go build -o myst-gui  ./cmd/myst-gui)
 
-sudo install -m755 mystd myst myst-tray /usr/local/bin/
+sudo install -m755 mystd myst myst-tray myst-gui /usr/local/bin/
 sudo install -m644 deploy/mystd.service /etc/systemd/system/
+sudo install -m644 desktop/myst-gui.desktop /usr/share/applications/
 
 sudo groupadd --system myst
 sudo usermod -aG myst "$USER"
@@ -274,12 +295,18 @@ sudo systemctl enable --now mystd
 
 Log out and back in for the group to take effect, then `myst connect`.
 
+The first build of the window takes a while — gotk4 is a large generated cgo
+binding and it is compiled from scratch once. Later builds are cached and fast.
+
 ### Layout
 
 ```
 cmd/mystd        privileged daemon: owns the tunnel, serves the control socket
 cmd/myst         unprivileged CLI: connect / disconnect / status / login / logout
-tray/            tray applet: its own Go module, because it needs a D-Bus library
+desktop/         the front ends: tray applet and GTK window, in their own module
+  cmd/myst-tray/   the tray applet
+  cmd/myst-gui/    the GTK4 window
+  internal/        the control-socket client and region list they share
 internal/        the packages behind the daemon and CLI
 deploy/          systemd unit
 docs/            API notes from the reverse-engineering work
@@ -317,7 +344,7 @@ a working daemon.
 ## The tray applet
 
 ```sh
-(cd tray && go build -o myst-tray .)
+(cd desktop && go build -o myst-tray ./cmd/myst-tray)
 sudo install -m755 myst-tray /usr/local/bin/
 
 mkdir -p ~/.config/autostart

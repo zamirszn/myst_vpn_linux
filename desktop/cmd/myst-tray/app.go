@@ -32,9 +32,9 @@ const pollInterval = 5 * time.Second
 // concrete client so the state machine can be driven in tests without a
 // socket, a daemon, or a D-Bus connection.
 type daemonClient interface {
-	status(ctx context.Context) (*status, error)
-	connect(ctx context.Context, country, ipType string) (*status, error)
-	disconnect(ctx context.Context) (*status, error)
+	Status(ctx context.Context) (*status, error)
+	Connect(ctx context.Context, country, ipType string) (*status, error)
+	Disconnect(ctx context.Context) (*status, error)
 }
 
 // app is the shared state behind both D-Bus objects. Every mutation goes
@@ -243,7 +243,7 @@ func (a *app) refresh(ctx context.Context) {
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	st, err := a.client.status(cctx)
+	st, err := a.client.Status(cctx)
 
 	a.mutate(func() {
 		if st == nil {
@@ -283,7 +283,7 @@ func (a *app) doConnect(country string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 
-		st, err := a.client.connect(ctx, target, "")
+		st, err := a.client.Connect(ctx, target, "")
 		log.Printf("connect %s: err=%v", target, err)
 
 		a.mutate(func() {
@@ -313,7 +313,7 @@ func (a *app) doDisconnect() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 
-		st, err := a.client.disconnect(ctx)
+		st, err := a.client.Disconnect(ctx)
 		log.Printf("disconnect: err=%v", err)
 
 		a.mutate(func() {

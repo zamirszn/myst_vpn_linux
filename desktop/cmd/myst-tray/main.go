@@ -53,7 +53,7 @@ func run() error {
 	}
 	defer conn.Close()
 
-	a := newApp(conn, client{path: *socket}, *country)
+	a := newApp(conn, client{Path: *socket}, *country)
 
 	// The well-known name is the tray convention, and the watcher records it so
 	// the panel can tell items apart.
