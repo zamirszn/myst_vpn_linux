@@ -25,3 +25,8 @@ profile/
 *.log
 node_modules/
 .DS_Store
+
+# ---- build output ----
+/myst
+/mystd
+/tray/myst-tray

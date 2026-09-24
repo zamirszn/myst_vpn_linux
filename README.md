@@ -233,13 +233,15 @@ handling** (see the gap above).
 
 ## The client
 
-Built in Go with **no external dependencies** — `crypto/ecdh` for the keypair,
-`net/http` for the API, `os/exec` for `wg-quick`.
+The daemon and CLI are built in Go with **no external dependencies** —
+`crypto/ecdh` for the keypair, `net/http` for the API, `os/exec` for `wg-quick`.
+The tray applet is the one exception and lives in its own module; see
+[The tray applet](#the-tray-applet).
 
 ```
 cmd/mystd        privileged daemon: owns the tunnel, serves the control socket
 cmd/myst         unprivileged CLI: connect / disconnect / status / login / logout
-cmd/myst-tray    tray applet (not yet written)
+tray/            tray applet: its own Go module, because it needs a D-Bus library
 ```
 
 | Package | Responsibility |
@@ -251,13 +253,23 @@ cmd/myst-tray    tray applet (not yet written)
 | `internal/ipc` | unix-socket control protocol |
 | `internal/killswitch` | nftables egress filter, armed while connected |
 | `internal/wakelock` | suspend inhibitor, held while connected |
+| `tray/` | StatusNotifierItem + dbusmenu tray icon (separate module) |
 
 ### Build and run
 
 ```sh
-go build ./...
-sudo install -m755 mystd /usr/local/bin/mystd
+# daemon and CLI — no external dependencies
+go build -o mystd ./cmd/mystd
+go build -o myst  ./cmd/myst
+sudo install -m755 mystd myst /usr/local/bin/
 sudo install -m644 deploy/mystd.service /etc/systemd/system/
+
+# let your desktop user drive the daemon; see "The control socket" below
+sudo groupadd --system myst
+sudo usermod -aG myst "$USER"
+sudo sed -i 's|^ExecStart=/usr/local/bin/mystd$|ExecStart=/usr/local/bin/mystd -socket-group myst|' \
+    /etc/systemd/system/mystd.service
+sudo systemctl daemon-reload
 sudo systemctl enable --now mystd
 
 myst connect --country gb
@@ -265,9 +277,76 @@ myst status
 myst disconnect
 ```
 
+Log out and back in once, so the new group membership takes effect.
+
 `myst login --from <token.json>` imports a captured token so the client can
 authenticate without a browser. Credentials land in `/var/lib/mystd/token.json`
 at 0600. The magic-link/PKCE flow is not yet implemented.
+
+### The control socket
+
+The daemon runs as root, so a unix socket it creates is `root:root`. At mode
+0660 that means **only root can talk to it** — the CLI and the tray would both
+fail with `permission denied` against a daemon that looks perfectly healthy.
+
+`mystd -socket-group <group>` hands the socket to a group instead:
+
+```sh
+sudo groupadd --system myst
+sudo usermod -aG myst "$USER"        # log out and back in afterwards
+```
+
+The mode is deliberately not widened to 0666 in the alternative. Anything that
+can open this socket can make a root process bring a tunnel up or down, so
+access is granted by group membership rather than to every account on the box.
+Naming a group that does not exist is a startup failure, not a silent fallback
+to root-only — a typo should not look like a working daemon.
+
+`mystd` logs which of the two it is doing at startup.
+
+### The tray applet
+
+```
+cd tray && go build -o myst-tray .
+```
+
+A shield in the system tray, filled by state:
+
+| | |
+|---|---|
+| green, keyhole | connected |
+| amber | connecting |
+| grey outline | not connected |
+| red, slashed | the last operation failed |
+| grey, slashed | the daemon is not answering |
+
+Left click connects or disconnects. Right click opens a menu with the state,
+Connect/Disconnect, a region submenu, Copy exit IP, and Quit.
+
+It holds **no credentials and no privileges**. Every action is a request over
+the control socket, so the tray can be run by the logged-in user while the only
+root process remains the daemon.
+
+**It is a separate Go module.** Everything else in this repo builds with the
+standard library alone; a tray icon cannot, because Go has no D-Bus in its
+standard library. Rather than give up that property project-wide, the tray lives
+in `tray/` with its own `go.mod` and one dependency, `github.com/godbus/dbus/v5`.
+It speaks StatusNotifierItem and `com.canonical.dbusmenu` directly — no cgo, no
+GTK, and no `libayatana-appindicator` headers to install.
+
+GNOME needs the AppIndicator extension for any of this to show up. If it is
+missing the applet says so and exits rather than running invisibly:
+
+```sh
+gnome-extensions enable ubuntu-appindicators@ubuntu.com
+```
+
+The region list is curated rather than fetched. The full country list lives
+behind `GET /connection/config`, which needs an access token — and the token
+belongs to the daemon, not to an unprivileged desktop applet. Copying the
+credential into the applet to populate a menu would undo the point of the
+split, so the applet offers the countries people actually pick and accepts any
+code passed to `-country`.
 
 ### The wake lock
 
@@ -379,6 +458,15 @@ forwarded traffic — containers, VMs on a bridge — is not covered. Closing th
 means adding a forward chain, which risks breaking Docker's networking and has
 not been attempted here.
 
+**The kill switch has been parsed, not loaded.** The generated ruleset is
+checked against the real `nft` parser in tests, which catches syntax errors, but
+loading it into a live kernel needs root and had not been done when this was
+written. Syntax-clean is not the same as correct.
+
+**The tray needs a StatusNotifier host.** On GNOME that means the AppIndicator
+extension; without it the applet exits with an explanation rather than running
+invisibly. Everything else here is desktop-agnostic.
+
 **IPv6 leaks by default.** See above.
 
 **Client identity.** Testing used `client_id=extension`, which labels a Linux client as the
@@ -397,6 +485,10 @@ Clarify before depending on it in anything you distribute.
 
 | File | Purpose |
 |---|---|
+| `cmd/mystd`, `cmd/myst` | The daemon and the CLI. |
+| `internal/` | The packages behind them. |
+| `tray/` | The tray applet, in its own module. |
+| `deploy/mystd.service` | systemd unit for the daemon, with notes on the socket group. |
 | `probe-wireguard-config.js` | Generates a WireGuard config via `POST /connection/router`, saves it 0600, prints structure with keys redacted. **Consumes a device slot.** |
 | `wg-test.sh` | Brings the tunnel up with `wg-quick`, verifies the exit IP, tears down. **Run with sudo.** Arms an auto-teardown before going up. |
 | `probe-connection-modes.js` | Read-only sweep for connection-mode endpoints. Consumes nothing. |
