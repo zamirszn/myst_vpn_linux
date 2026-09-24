@@ -967,3 +967,64 @@ func fieldValue(conf, field string) string {
 	}
 	return ""
 }
+
+// TestNoServerInRegionIsExplained is the regression for the failure a first-run
+// click on Connect actually hit.
+//
+// The US had no free WireGuard node. The API reports that as an HTTP 500, and
+// the client passed it straight through as "api 500 2332: Could not retrieve
+// wireguard connect configuration" — a server fault, from the user's side,
+// with nothing to act on. The region is unserved, not broken, and saying which
+// one and what to do about it is the whole difference.
+func TestNoServerInRegionIsExplained(t *testing.T) {
+	env := newTestDaemon(t, func(_ *Config, env *testEnv, _ *Deps) {
+		env.api.connectErr = &api.APIError{
+			Status:  500,
+			Code:    "2332",
+			Message: "Could not retrieve wireguard connect configuration",
+			// The real body, trimmed only of the UserID.
+			Detail: "Could not retrieve wireguard connect configuration: failed to " +
+				"find available wireguard server: no available instance for filters: " +
+				"{Country:us City: IPType: UserID:test-user UserPlanID:plan_example HashSalt:}",
+		}
+	})
+
+	_, err := env.d.Connect(context.Background(), "us", "")
+	if err == nil {
+		t.Fatal("Connect reported success against an API that refused the region")
+	}
+
+	msg := err.Error()
+	if !strings.Contains(msg, `"us"`) {
+		t.Errorf("the error does not name the region that failed: %q", msg)
+	}
+	if !strings.Contains(msg, "another region") {
+		t.Errorf("the error does not tell the user what to do: %q", msg)
+	}
+	if strings.Contains(msg, "provision tunnel: api 500") {
+		t.Errorf("the raw server fault is still the whole message: %q", msg)
+	}
+}
+
+// TestNoServerAnywhereIsExplained covers the same condition with no country
+// asked for, where there is no region to name. The old code reached this path
+// only when the API had nothing free at all, which is rare — but the advice
+// must still not be "try another region", because none was requested.
+func TestNoServerAnywhereIsExplained(t *testing.T) {
+	env := newTestDaemon(t, func(_ *Config, env *testEnv, _ *Deps) {
+		env.api.connectErr = &api.APIError{
+			Status:  500,
+			Code:    "2332",
+			Message: "Could not retrieve wireguard connect configuration",
+			Detail:  "failed to find available wireguard server: no available instance for filters: {Country: City: IPType:}",
+		}
+	})
+
+	_, err := env.d.Connect(context.Background(), "", "")
+	if err == nil {
+		t.Fatal("Connect reported success against an API that refused the region")
+	}
+	if msg := err.Error(); !strings.Contains(msg, "try again") {
+		t.Errorf("the error gives the user nothing to do: %q", msg)
+	}
+}

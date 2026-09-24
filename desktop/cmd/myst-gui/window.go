@@ -24,6 +24,10 @@ const pollInterval = 2 * time.Second
 // that were about to succeed.
 const opTimeout = 3 * time.Minute
 
+// fastestLabel is the region picker's first entry. It sends no country at all,
+// which asks the API to choose the best node.
+const fastestLabel = "Fastest (recommended)"
+
 type window struct {
 	app    *gtk.Application
 	client daemonclient.Client
@@ -77,7 +81,14 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	w.action = gtk.NewButtonWithLabel("Connect")
 	w.action.ConnectClicked(func() { w.toggle() })
 
-	names := make([]string, 0, len(regions.All))
+	// Entry 0 is "Fastest" and the regions follow it. Without that leading
+	// entry the picker opens on whichever region happens to be first in the
+	// list, so a first-run click on Connect silently asks for that one country
+	// — and fails outright whenever that country has no node free, which is
+	// exactly what happened with the US. Asking for nothing is the safe
+	// default, and it is what the CLI already does.
+	names := make([]string, 0, len(regions.All)+1)
+	names = append(names, fastestLabel)
 	for _, r := range regions.All {
 		names = append(names, r.Name)
 	}
@@ -211,12 +222,30 @@ func (w *window) toggle() {
 
 // selectedRegion is the country code currently chosen in the picker, or "" to
 // let the API choose the fastest.
-func (w *window) selectedRegion() string {
-	i := int(w.region.Selected())
-	if i < 0 || i >= len(regions.All) {
+func (w *window) selectedRegion() string { return regionCodeAt(int(w.region.Selected())) }
+
+// regionCodeAt maps a picker row to a country code, and regionRow does the
+// reverse. They are the only place the "Fastest" offset lives, because an
+// off-by-one here would silently connect the user to the wrong country.
+func regionCodeAt(row int) string {
+	// Row 0 is "Fastest" and a fresh dropdown reports -1, so both mean the same
+	// thing: ask for no country in particular.
+	if row <= 0 || row > len(regions.All) {
 		return ""
 	}
-	return regions.All[i].Code
+	return regions.All[row-1].Code
+}
+
+func regionRow(code string) uint {
+	if code == "" {
+		return 0
+	}
+	for i, r := range regions.All {
+		if r.Code == code {
+			return uint(i + 1) // +1 for the leading "Fastest" entry
+		}
+	}
+	return 0
 }
 
 // run performs one daemon operation off the main loop. A connect provisions a
@@ -323,14 +352,7 @@ func (w *window) apply(st daemonclient.Status) {
 
 // selectRegion moves the picker to a country code, so the window shows the
 // region actually in use rather than the one that happened to be highlighted.
-func (w *window) selectRegion(code string) {
-	for i, r := range regions.All {
-		if r.Code == code {
-			w.region.SetSelected(uint(i))
-			return
-		}
-	}
-}
+func (w *window) selectRegion(code string) { w.region.SetSelected(regionRow(code)) }
 
 // showUnreachable is for a daemon that did not answer at all, which is a
 // different problem from a daemon that answered with a failure.

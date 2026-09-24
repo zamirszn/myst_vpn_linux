@@ -69,6 +69,22 @@ func (e *APIError) IsNoDeviceSlots() bool {
 		strings.Contains(e.Detail, "allowed_devices_limit")
 }
 
+// IsNoServerInRegion reports that the requested country has no node able to
+// serve a tunnel right now.
+//
+// This arrives as an HTTP 500 like a genuine server fault, and the body is the
+// only thing that distinguishes them:
+//
+//	failed to find available wireguard server: no available instance for
+//	filters: {Country:us ...}
+//
+// The difference matters to the user. A 500 says "the server broke, try later";
+// this says "that country is unserved at the moment, pick another one" — which
+// is something they can act on immediately.
+func (e *APIError) IsNoServerInRegion() bool {
+	return strings.Contains(e.Detail, "no available instance for filters")
+}
+
 // IsUnauthorized reports an expired or rejected token, which the caller should
 // resolve by refreshing rather than by surfacing to the user.
 func (e *APIError) IsUnauthorized() bool { return e.Status == http.StatusUnauthorized }

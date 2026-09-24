@@ -10,7 +10,6 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"log"
 	"os"
 
@@ -45,10 +44,4 @@ func main() {
 	// Only argv[0] is passed on: the flag above is ours, not GTK's, and
 	// GApplication treats an option it does not recognise as a fatal error.
 	os.Exit(app.Run(os.Args[:1]))
-}
-
-// fatal reports a problem the window cannot work around and gives up.
-func fatal(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "myst-gui: %s\n", fmt.Sprintf(format, args...))
-	os.Exit(1)
 }

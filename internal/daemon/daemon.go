@@ -376,6 +376,16 @@ func (d *Daemon) bringUp(ctx context.Context, country, ipType string) (*ipc.Stat
 		Country:   country,
 	})
 	if err != nil {
+		// A country with no node free is not a server fault, though the API
+		// reports it as one. Saying so plainly is the difference between a user
+		// who picks another region and one who concludes the client is broken.
+		var apiErr *api.APIError
+		if errors.As(err, &apiErr) && apiErr.IsNoServerInRegion() {
+			if country != "" {
+				return nil, fmt.Errorf("no servers are available in %q at the moment — try another region, or connect without --country to let the client pick the fastest", country)
+			}
+			return nil, errors.New("no servers are available at the moment — try again shortly")
+		}
 		return nil, fmt.Errorf("provision tunnel: %w", err)
 	}
 	if resp.WGConfig == "" {

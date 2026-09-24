@@ -81,6 +81,9 @@ daemon every two seconds, so a change made anywhere else — from the CLI, from 
 tray, or by the health monitor repairing a dropped tunnel — shows up there
 within a moment.
 
+The region picker opens on **Fastest**, which asks for no country in particular
+and lets the API pick a free node. Choose a country and it will use that one.
+
 Like the tray, it holds no credentials and no privileges. Every action is a
 request over the control socket, so it runs as your user while the only root
 process remains the daemon.
@@ -223,6 +226,17 @@ been watched through a real drop on a live tunnel.
 **IPv6 leaks by default in Mysterium's own config.** It assigns an IPv6 address
 but routes no IPv6, so on a host with IPv6 connectivity that traffic bypasses the
 tunnel. This client appends `::/0` to close it; `-no-ipv6` turns that off.
+
+**A region can be temporarily unserved.** Ask for a country with no free node
+and the API answers with an HTTP 500 — which reads like a server fault but is
+not one. The country simply has nothing available at that moment, and the fix is
+to pick another. The client says exactly that instead of passing the 500
+through, because "api 500 2332: Could not retrieve wireguard connect
+configuration" tells you nothing you can act on.
+
+This is why the window's picker defaults to **Fastest** and the CLI takes no
+country unless you name one: asking for nothing lets the API choose a node that
+is actually free, rather than one you did not mean to choose.
 
 **The tray's region list is curated, not fetched.** The full country list lives
 behind an authenticated endpoint, and the token belongs to the daemon — copying
