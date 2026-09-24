@@ -18,6 +18,7 @@ import (
 
 	"github.com/zamirszn/mysterium-linux-client/internal/daemon"
 	"github.com/zamirszn/mysterium-linux-client/internal/ipc"
+	"github.com/zamirszn/mysterium-linux-client/internal/killswitch"
 )
 
 func main() {
@@ -29,13 +30,14 @@ func main() {
 
 func run() error {
 	var (
-		socket     = flag.String("socket", ipc.DefaultSocketPath, "unix socket to listen on")
-		configPath = flag.String("config", daemon.DefaultConfigPath, "WireGuard config path")
-		tokenPath  = flag.String("token", daemon.DefaultTokenPath, "credential store path")
-		baseURL    = flag.String("api", "", "override the API base URL")
-		noWakeLock = flag.Bool("no-wakelock", false, "allow the machine to suspend while connected")
-		noIPv6     = flag.Bool("no-ipv6", false, "do not route IPv6 through the tunnel (leaks on IPv6 hosts)")
-		verbose    = flag.Bool("v", false, "verbose logging")
+		socket       = flag.String("socket", ipc.DefaultSocketPath, "unix socket to listen on")
+		configPath   = flag.String("config", daemon.DefaultConfigPath, "WireGuard config path")
+		tokenPath    = flag.String("token", daemon.DefaultTokenPath, "credential store path")
+		baseURL      = flag.String("api", "", "override the API base URL")
+		noWakeLock   = flag.Bool("no-wakelock", false, "allow the machine to suspend while connected")
+		noIPv6       = flag.Bool("no-ipv6", false, "do not route IPv6 through the tunnel (leaks on IPv6 hosts)")
+		noKillSwitch = flag.Bool("no-killswitch", false, "do not block traffic outside the tunnel when it drops")
+		verbose      = flag.Bool("v", false, "verbose logging")
 	)
 	flag.Parse()
 
@@ -57,6 +59,7 @@ func run() error {
 		ConfigPath: *configPath,
 		IPv6:       !*noIPv6,
 		WakeLock:   !*noWakeLock,
+		KillSwitch: !*noKillSwitch,
 	}, daemon.Deps{Logger: log})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -67,6 +70,26 @@ func run() error {
 		return err
 	}
 	log.Info("listening", "socket", *socket)
+
+	// Clear anything a previous run left behind. A hard kill between arming the
+	// filter and bringing the tunnel up would otherwise leave the machine with
+	// no network and nothing still running to remove it.
+	//
+	// This runs after Listen on purpose: only one daemon can hold the socket,
+	// so a second instance cannot disarm the first one's filter on its way in.
+	//
+	// Gated on root because nft reports "operation not permitted" rather than
+	// "no such table" otherwise, which would produce a misleading warning on a
+	// daemon that could not have armed anything in the first place.
+	if os.Geteuid() == 0 {
+		ks := killswitch.Nft{}
+		if armed, err := ks.Active(context.Background()); err == nil && armed {
+			log.Warn("clearing an egress filter left armed by a previous run")
+		}
+		if err := ks.Remove(context.Background()); err != nil {
+			log.Warn("could not clear a stale egress filter", "err", err)
+		}
+	}
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ctx) }()

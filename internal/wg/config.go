@@ -1,9 +1,12 @@
 package wg
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -81,6 +84,44 @@ func EnsureIPv6Route(conf string) string {
 		}
 	}
 	return conf
+}
+
+// Endpoint returns the peer's host and port.
+//
+// The kill switch needs this before the tunnel exists: the endpoint is the one
+// destination that must stay reachable, or the tunnel could never re-establish
+// itself after a drop.
+func Endpoint(conf string) (host string, port int, err error) {
+	for _, line := range strings.Split(conf, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "Endpoint") {
+			continue
+		}
+		_, value, ok := strings.Cut(trimmed, "=")
+		if !ok {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+
+		// SplitHostPort also handles the bracketed form used for IPv6,
+		// e.g. [2001:db8::1]:51820.
+		h, p, err := net.SplitHostPort(value)
+		if err != nil {
+			return "", 0, fmt.Errorf("parse Endpoint %q: %w", value, err)
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return "", 0, fmt.Errorf("parse Endpoint port %q: %w", p, err)
+		}
+		if n < 1 || n > 65535 {
+			return "", 0, fmt.Errorf("Endpoint port %d is out of range", n)
+		}
+		return h, n, nil
+	}
+	return "", 0, errors.New("config has no Endpoint")
 }
 
 func hasField(conf, field string) bool {

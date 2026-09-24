@@ -249,6 +249,7 @@ cmd/myst-tray    tray applet (not yet written)
 | `internal/auth` | token storage and refresh |
 | `internal/daemon` | the connect/disconnect state machine |
 | `internal/ipc` | unix-socket control protocol |
+| `internal/killswitch` | nftables egress filter, armed while connected |
 | `internal/wakelock` | suspend inhibitor, held while connected |
 
 ### Build and run
@@ -285,6 +286,68 @@ This is about **suspend, not logout**. The daemon is a *system* service, so
 logging out of the desktop does not affect it and no `loginctl enable-linger` is
 needed.
 
+### The kill switch
+
+Neither the WireGuard config nor `wg-quick` blocks traffic when a tunnel drops.
+Without one, a dropped tunnel means traffic quietly continues in the clear from
+the same machine — the failure mode a VPN exists to prevent.
+
+While connected, the daemon installs an nftables egress filter in its own table:
+
+```nft
+table inet myst_killswitch {
+	chain output {
+		type filter hook output priority 0; policy accept;
+
+		oifname "lo" accept
+		oifname "myst0" accept
+
+		# the WireGuard handshake, or the tunnel could never come back
+		ip daddr 91.98.228.210 udp dport 56666 accept
+
+		udp sport 68 udp dport 67 accept      # DHCP renewal
+		udp sport 546 udp dport 547 accept    # DHCPv6
+		meta l4proto ipv6-icmp accept         # neighbour discovery
+
+		counter drop
+	}
+}
+```
+
+Four things about this are deliberate:
+
+**It fails closed.** The filter goes in *before* the interface comes up and comes
+out *after* it goes down, so there is never a window in which traffic could
+escape. A test asserts that ordering rather than assuming it.
+
+**No `ct state established,related accept`.** The obvious rule to add, and the
+wrong one: connections opened before the filter was armed would keep flowing out
+of the physical interface, which is exactly the leak being prevented.
+
+**The endpoint always stays reachable.** A filter that blocked the WireGuard
+handshake would stop the tunnel from ever re-establishing, leaving the machine
+offline. The daemon refuses to arm with no endpoint at all, and resolves a
+hostname endpoint *before* arming, so the rule is right either way.
+
+**It is one table.** Nothing you already have — ufw, Docker, hand-written rules —
+is read or modified; the filter is created and deleted as a unit. That is also
+the escape hatch:
+
+```sh
+sudo nft delete table inet myst_killswitch
+```
+
+`mystd` clears a stale filter on startup, so a daemon killed mid-connect cannot
+leave you without a network. `myst status` reports whether it is armed; disable
+it with `mystd -no-killswitch`.
+
+**What it does not cover.** It filters the *output* hook, so it governs traffic
+originating on this host. Traffic forwarded on behalf of containers does not
+traverse that hook and is **not** filtered — with Docker running, container
+traffic can still leave in the clear when the tunnel drops. The filter is also
+egress-only: unsolicited inbound is not filtered, which is the same posture as
+having no kill switch, since nothing but the handshake is listening.
+
 ### What was already true on this machine
 
 `mystd` is **not** what keeps this box awake. It was already configured that way,
@@ -311,8 +374,10 @@ sudo systemctl mask hibernate.target hybrid-sleep.target
 
 ## Limitations — be honest about these
 
-**The kill switch is yours to build.** Neither the config nor `wg-quick` provides one.
-Shipping without it means leaks on tunnel failure.
+**The kill switch covers host traffic only.** It filters the output hook, so
+forwarded traffic — containers, VMs on a bridge — is not covered. Closing that
+means adding a forward chain, which risks breaking Docker's networking and has
+not been attempted here.
 
 **IPv6 leaks by default.** See above.
 

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/zamirszn/mysterium-linux-client/internal/api"
 	"github.com/zamirszn/mysterium-linux-client/internal/auth"
 	"github.com/zamirszn/mysterium-linux-client/internal/ipc"
+	"github.com/zamirszn/mysterium-linux-client/internal/killswitch"
 	"github.com/zamirszn/mysterium-linux-client/internal/wakelock"
 	"github.com/zamirszn/mysterium-linux-client/internal/wg"
 )
@@ -53,6 +55,14 @@ type Lock interface{ Release() }
 
 // LockFunc acquires a wake lock.
 type LockFunc func(ctx context.Context, why string) (Lock, error)
+
+// KillSwitch arms and disarms the egress filter that keeps traffic inside the
+// tunnel when the tunnel is down.
+type KillSwitch interface {
+	Install(ctx context.Context, spec killswitch.Spec) error
+	Remove(ctx context.Context) error
+	Active(ctx context.Context) (bool, error)
+}
 
 // WGTunnel adapts the wg package to the Tunnel interface.
 type WGTunnel struct{}
@@ -91,6 +101,11 @@ type Config struct {
 	// WakeLock inhibits suspend while connected. Defaults on.
 	WakeLock bool
 
+	// KillSwitch installs an nftables egress filter while connected, so that a
+	// dropped tunnel blocks traffic rather than letting it escape in the clear.
+	// Defaults on. Set false to leave the machine's routing to fend for itself.
+	KillSwitch bool
+
 	RefreshMargin time.Duration
 
 	// HandshakeTimeout bounds the wait for a first handshake.
@@ -104,6 +119,7 @@ type Deps struct {
 	Tokens      TokenSource
 	Store       auth.Store
 	AcquireLock LockFunc
+	KillSwitch  KillSwitch
 	Logger      *slog.Logger
 }
 
@@ -115,6 +131,7 @@ type Daemon struct {
 	tokens TokenSource
 	store  auth.Store
 	lock   LockFunc
+	ks     KillSwitch
 	log    *slog.Logger
 
 	// mu serialises the state machine. Connect is slow and touches global
@@ -169,6 +186,9 @@ func New(cfg Config, deps Deps) *Daemon {
 	if deps.AcquireLock == nil {
 		deps.AcquireLock = defaultLock
 	}
+	if deps.KillSwitch == nil {
+		deps.KillSwitch = killswitch.Nft{}
+	}
 
 	return &Daemon{
 		cfg:    cfg,
@@ -177,6 +197,7 @@ func New(cfg Config, deps Deps) *Daemon {
 		tokens: deps.Tokens,
 		store:  deps.Store,
 		lock:   deps.AcquireLock,
+		ks:     deps.KillSwitch,
 		log:    deps.Logger,
 		status: ipc.Status{State: ipc.StateDisconnected},
 	}
@@ -278,6 +299,21 @@ func (d *Daemon) bringUp(ctx context.Context, country, ipType string) (*ipc.Stat
 		return nil, err
 	}
 
+	// Arm the filter before the interface exists, so there is no window in
+	// which traffic could escape in the clear. The endpoint has to be resolved
+	// first, while DNS is still reachable.
+	killSwitchArmed := false
+	if d.cfg.KillSwitch {
+		eps, err := d.handshakeEndpoints(ctx, conf)
+		if err != nil {
+			return nil, err
+		}
+		if err := d.ks.Install(ctx, killswitch.Spec{Interface: d.cfg.Interface, Endpoints: eps}); err != nil {
+			return nil, fmt.Errorf("arm the kill switch: %w", err)
+		}
+		killSwitchArmed = true
+	}
+
 	if err := d.tun.Up(ctx, d.cfg.ConfigPath); err != nil {
 		return nil, fmt.Errorf("bring up %s: %w", d.cfg.Interface, err)
 	}
@@ -324,7 +360,42 @@ func (d *Daemon) bringUp(ctx context.Context, country, ipType string) (*ipc.Stat
 		Interface:  d.cfg.Interface,
 		IPv6Routed: wg.RoutesIPv6(conf),
 		WakeLock:   wakeLock,
+		KillSwitch: killSwitchArmed,
 	}, nil
+}
+
+// handshakeEndpoints returns the destinations that must stay reachable while
+// the kill switch is armed.
+//
+// Getting this wrong is self-defeating in a specific way: a filter that blocks
+// the WireGuard endpoint prevents the tunnel from ever re-establishing, so the
+// machine would sit offline until someone found the escape hatch.
+func (d *Daemon) handshakeEndpoints(ctx context.Context, conf string) ([]killswitch.Endpoint, error) {
+	host, port, err := wg.Endpoint(conf)
+	if err != nil {
+		return nil, fmt.Errorf("cannot arm the kill switch: %w", err)
+	}
+
+	// Mysterium hands back a bare IP, so this is normally a no-op. Resolving
+	// anyway means a hostname endpoint still produces a correct filter rather
+	// than one that silently blocks the handshake.
+	if ip := net.ParseIP(host); ip != nil {
+		return []killswitch.Endpoint{{IP: ip.String(), Port: port}}, nil
+	}
+
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil, fmt.Errorf("cannot arm the kill switch: resolve endpoint %q: %w", host, err)
+	}
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("cannot arm the kill switch: endpoint %q resolved to no addresses", host)
+	}
+
+	eps := make([]killswitch.Endpoint, 0, len(addrs))
+	for _, a := range addrs {
+		eps = append(eps, killswitch.Endpoint{IP: a.Unmap().String(), Port: port})
+	}
+	return eps, nil
 }
 
 // waitForHandshake waits for positive evidence that the tunnel works.
@@ -394,6 +465,16 @@ func (d *Daemon) teardown(ctx context.Context) error {
 	if d.held != nil {
 		d.held.Release()
 		d.held = nil
+	}
+
+	// Disarm only after the interface is down. Removing the filter first would
+	// open a window in which traffic could leave in the clear while routes
+	// still pointed at the tunnel.
+	//
+	// Called unconditionally, even when the kill switch is disabled: it also
+	// clears a table a previous run left behind.
+	if err := d.ks.Remove(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("disarm the kill switch: %w", err))
 	}
 
 	// Release server-side even if the local half failed, so the account does
