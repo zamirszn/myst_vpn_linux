@@ -20,10 +20,14 @@ import (
 const defaultSocketPath = "/run/mystd/mystd.sock"
 
 // Tunnel lifecycle states, as reported by the daemon.
+//
+// A root-module test reads this file and fails if it is missing a state the
+// daemon can report, so the two cannot drift apart unnoticed.
 const (
 	stateDisconnected = "disconnected"
 	stateConnecting   = "connecting"
 	stateConnected    = "connected"
+	stateReconnecting = "reconnecting"
 	stateError        = "error"
 )
 

@@ -50,7 +50,10 @@ func styleFor(state string, reachable bool) iconStyle {
 	switch state {
 	case stateConnected:
 		return iconStyle{fill: colConnected, solid: true, keyhole: true}
-	case stateConnecting:
+	case stateConnecting, stateReconnecting:
+		// Both mean "work in progress, wait". They share a look deliberately:
+		// the difference between a connect the user asked for and a reconnect
+		// the daemon started is worth a menu line, not a second icon to learn.
 		return iconStyle{fill: colConnecting, solid: true}
 	case stateError:
 		return iconStyle{fill: colError, solid: true, slash: true}

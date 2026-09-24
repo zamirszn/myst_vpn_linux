@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -37,7 +38,10 @@ const (
 	testEndpointPort = 56666
 )
 
+// fakeTunnel is guarded by a mutex because the health monitor drives it from
+// its own goroutine once a connection is up.
 type fakeTunnel struct {
+	mu           sync.Mutex
 	up           bool
 	upCalls      int
 	downCalls    int
@@ -46,32 +50,110 @@ type fakeTunnel struct {
 	handshakeErr error
 	exitIP       string
 	exitErr      error
+	route        wg.Route
+	routeErr     error
+
+	// noHandshake models an interface that comes up and never reaches its
+	// peer, which is the failure the connect path has to roll back.
+	noHandshake bool
 }
 
 func (f *fakeTunnel) Up(context.Context, string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.upCalls++
 	if f.upErr != nil {
 		return f.upErr
 	}
 	f.up = true
+	// A freshly created interface handshakes with its peer, which is what the
+	// daemon waits for before it will call the tunnel up. Refreshing here keeps
+	// that true across a reconnect, so a recovery is not immediately seen as
+	// dead again by the very monitor that just performed it.
+	if !f.noHandshake {
+		f.handshake = time.Now()
+	}
 	return nil
 }
 
+// neverHandshakes models an interface that comes up and stays silent.
+func (f *fakeTunnel) neverHandshakes() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.handshake = time.Time{}
+	f.noHandshake = true
+}
+
 func (f *fakeTunnel) Down(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.downCalls++
 	f.up = false
 	return nil
 }
 
-func (f *fakeTunnel) IsUp(context.Context) bool { return f.up }
+func (f *fakeTunnel) IsUp(context.Context) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.up
+}
 
 func (f *fakeTunnel) Handshake(context.Context) (time.Time, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.handshake, f.handshakeErr
 }
 
-func (f *fakeTunnel) ExitIP(context.Context) (string, error) { return f.exitIP, f.exitErr }
+func (f *fakeTunnel) ExitIP(context.Context) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.exitIP, f.exitErr
+}
+
+func (f *fakeTunnel) DefaultRoute(context.Context) (wg.Route, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.route, f.routeErr
+}
+
+// calls reports how many times the interface was brought up and down.
+func (f *fakeTunnel) calls() (up, down int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.upCalls, f.downCalls
+}
+
+// interfaceUp reports whether the fake interface currently exists.
+func (f *fakeTunnel) interfaceUp() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.up
+}
+
+// setInterface simulates the interface appearing or disappearing behind the
+// daemon's back.
+func (f *fakeTunnel) setInterface(up bool) {
+	f.mu.Lock()
+	f.up = up
+	f.mu.Unlock()
+}
+
+// setRoute simulates the machine moving to a different network.
+func (f *fakeTunnel) setRoute(r wg.Route) {
+	f.mu.Lock()
+	f.route = r
+	f.mu.Unlock()
+}
+
+// setHandshake backdates the last handshake, as a dropped tunnel would.
+func (f *fakeTunnel) setHandshake(at time.Time) {
+	f.mu.Lock()
+	f.handshake = at
+	f.mu.Unlock()
+}
 
 type fakeAPI struct {
+	mu          sync.Mutex
 	connectResp *api.WireguardConnectResponse
 	connectErr  error
 	disconnects int
@@ -79,6 +161,8 @@ type fakeAPI struct {
 }
 
 func (f *fakeAPI) Connect(_ context.Context, req api.WireguardConnectRequest) (*api.WireguardConnectResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.lastReq = req
 	if f.connectErr != nil {
 		return nil, f.connectErr
@@ -87,8 +171,32 @@ func (f *fakeAPI) Connect(_ context.Context, req api.WireguardConnectRequest) (*
 }
 
 func (f *fakeAPI) Disconnect(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.disconnects++
 	return nil
+}
+
+// disconnectCount reports how many times the server-side connection was given up.
+func (f *fakeAPI) disconnectCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.disconnects
+}
+
+// lastRequest reports the most recent provisioning request.
+func (f *fakeAPI) lastRequest() api.WireguardConnectRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastReq
+}
+
+// failConnectFrom makes every later provisioning attempt fail, as a node that
+// has gone away would.
+func (f *fakeAPI) failConnectFrom(err error) {
+	f.mu.Lock()
+	f.connectErr = err
+	f.mu.Unlock()
 }
 
 type fakeTokens struct {
@@ -104,13 +212,25 @@ func (f *fakeTokens) EnsureValid(context.Context, auth.Store, time.Duration) (*a
 }
 
 type fakeLock struct {
+	mu       sync.Mutex
 	released bool
 	err      error
 }
 
-func (l *fakeLock) Release() { l.released = true }
+func (l *fakeLock) Release() {
+	l.mu.Lock()
+	l.released = true
+	l.mu.Unlock()
+}
+
+func (l *fakeLock) wasReleased() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.released
+}
 
 type fakeKillSwitch struct {
+	mu         sync.Mutex
 	installed  bool
 	installs   int
 	removes    int
@@ -119,6 +239,8 @@ type fakeKillSwitch struct {
 }
 
 func (f *fakeKillSwitch) Install(_ context.Context, spec killswitch.Spec) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.installs++
 	if f.installErr != nil {
 		return f.installErr
@@ -129,12 +251,32 @@ func (f *fakeKillSwitch) Install(_ context.Context, spec killswitch.Spec) error 
 }
 
 func (f *fakeKillSwitch) Remove(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.removes++
 	f.installed = false
 	return nil
 }
 
-func (f *fakeKillSwitch) Active(context.Context) (bool, error) { return f.installed, nil }
+func (f *fakeKillSwitch) Active(context.Context) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.installed, nil
+}
+
+// armed reports whether the egress filter is currently installed.
+func (f *fakeKillSwitch) armed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.installed
+}
+
+// removeCount reports how many times the filter was disarmed.
+func (f *fakeKillSwitch) removeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.removes
+}
 
 // testEnv holds everything a test needs to inspect after driving the daemon.
 type testEnv struct {
@@ -167,7 +309,11 @@ func newTestDaemon(t *testing.T, tune func(*Config, *testEnv, *Deps)) *testEnv {
 		HandshakeTimeout: 300 * time.Millisecond,
 	}
 	env := &testEnv{
-		tun:     &fakeTunnel{handshake: time.Now(), exitIP: "203.0.113.7"},
+		tun: &fakeTunnel{
+			handshake: time.Now(),
+			exitIP:    "203.0.113.7",
+			route:     wg.Route{Gateway: "10.0.0.1", Interface: "wlo1"},
+		},
 		lock:    &fakeLock{},
 		ks:      &fakeKillSwitch{},
 		cfgPath: cfg.ConfigPath,
@@ -326,7 +472,7 @@ func TestFailedConnectDisarmsTheKillSwitch(t *testing.T) {
 	// A connect that arms the filter and then fails would otherwise leave the
 	// machine with no network and nothing left to remove it.
 	env := newTestDaemon(t, func(_ *Config, e *testEnv, _ *Deps) {
-		e.tun.handshake = time.Time{}
+		e.tun.neverHandshakes()
 	})
 
 	if _, err := env.d.Connect(context.Background(), "gb", ""); err == nil {
@@ -378,7 +524,7 @@ func TestKillSwitchDisabledDoesNotArm(t *testing.T) {
 
 func TestConnectRollsBackWhenHandshakeNeverCompletes(t *testing.T) {
 	env := newTestDaemon(t, func(_ *Config, e *testEnv, _ *Deps) {
-		e.tun.handshake = time.Time{} // interface up, peer silent
+		e.tun.neverHandshakes() // interface up, peer silent
 	})
 
 	st, err := env.d.Connect(context.Background(), "gb", "")
@@ -467,9 +613,12 @@ func TestStatusDetectsVanishedInterface(t *testing.T) {
 	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
+	if !env.ks.armed() {
+		t.Fatal("the connect did not arm the kill switch")
+	}
 
 	// Something outside the daemon took the interface down.
-	env.tun.up = false
+	env.tun.setInterface(false)
 
 	st, err := env.d.Status(context.Background())
 	if err != nil {
@@ -481,8 +630,17 @@ func TestStatusDetectsVanishedInterface(t *testing.T) {
 	if st.LastError == "" {
 		t.Error("no explanation was recorded for the dropped tunnel")
 	}
-	if !env.lock.released {
+	if !env.lock.wasReleased() {
 		t.Error("the wake lock was held for a tunnel that no longer exists")
+	}
+	// Releasing the wake lock is not enough, and this is the regression that
+	// mattered: an armed filter with no tunnel behind it drops every packet, so
+	// the machine looks like it has broken wifi rather than a dropped VPN.
+	if env.ks.armed() {
+		t.Error("the kill switch was left armed after the tunnel vanished — the machine would have no network")
+	}
+	if env.ks.removeCount() == 0 {
+		t.Error("the kill switch was never disarmed")
 	}
 }
 
@@ -528,6 +686,193 @@ func TestConnectSurfacesProvisioningFailure(t *testing.T) {
 	}
 }
 
+// --- health monitor ---------------------------------------------------------
+
+// monitorOn turns the health monitor on with a short interval, so a test does
+// not have to sit through the ten-second default between checks.
+func monitorOn(c *Config) {
+	c.Monitor = true
+	c.MonitorInterval = 5 * time.Millisecond
+}
+
+// waitFor polls cond until it holds. The monitor runs on its own goroutine, so
+// its effects have to be observed rather than returned to the test.
+func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %s waiting for %s", timeout, what)
+}
+
+func TestMonitorReconnectsAfterTheNetworkChanges(t *testing.T) {
+	env := newTestDaemon(t, func(c *Config, _ *testEnv, _ *Deps) { monitorOn(c) })
+
+	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// The machine moves to a different wifi network. The interface stays up —
+	// it is virtual — so the changed default route is the only evidence there
+	// is, and the handshake would not look stale for another minute yet.
+	env.tun.setRoute(wg.Route{Gateway: "192.168.1.1", Interface: "wlo1"})
+
+	waitFor(t, 5*time.Second, "the monitor to rebuild the tunnel", func() bool {
+		up, _ := env.tun.calls()
+		return up == 2
+	})
+	waitFor(t, 5*time.Second, "the tunnel to read as connected again", func() bool {
+		return env.d.snapshot().State == ipc.StateConnected
+	})
+
+	if !env.tun.interfaceUp() {
+		t.Error("the interface is not up after a recovery")
+	}
+	if got := env.api.lastRequest().Country; got != "gb" {
+		t.Errorf("recovery connected to %q, want gb — a recovery must not move the user to another region", got)
+	}
+	if st := env.d.snapshot(); st.LastError != "" {
+		t.Errorf("LastError = %q, want it cleared after a successful recovery", st.LastError)
+	}
+}
+
+func TestMonitorReconnectsAfterTheHandshakeGoesStale(t *testing.T) {
+	env := newTestDaemon(t, func(c *Config, _ *testEnv, _ *Deps) {
+		monitorOn(c)
+		c.StaleAfter = 50 * time.Millisecond
+	})
+
+	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// The route is unchanged, so the fast path cannot see this: the peer simply
+	// stopped answering. With a 25-second keepalive, a handshake an hour old
+	// means the tunnel is gone.
+	env.tun.setHandshake(time.Now().Add(-time.Hour))
+
+	waitFor(t, 5*time.Second, "the monitor to rebuild the tunnel", func() bool {
+		up, _ := env.tun.calls()
+		return up == 2
+	})
+
+	// A recovery refreshes the handshake, so this must settle rather than spin.
+	time.Sleep(50 * time.Millisecond)
+	if up, _ := env.tun.calls(); up != 2 {
+		t.Errorf("Up called %d times, want 2 — the monitor is rebuilding a healthy tunnel", up)
+	}
+}
+
+func TestMonitorReturnsTheNetworkWhenRecoveryKeepsFailing(t *testing.T) {
+	env := newTestDaemon(t, func(c *Config, _ *testEnv, _ *Deps) { monitorOn(c) })
+
+	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if !env.ks.armed() {
+		t.Fatal("the connect did not arm the kill switch")
+	}
+
+	// The network moved and the node is unreachable, so every reconnect fails.
+	env.tun.setRoute(wg.Route{Gateway: "192.168.1.1", Interface: "wlo1"})
+	env.api.failConnectFrom(errors.New("node unreachable"))
+
+	waitFor(t, 10*time.Second, "the monitor to give up and return the network", func() bool {
+		return env.d.snapshot().State == ipc.StateError
+	})
+
+	st := env.d.snapshot()
+	if !strings.Contains(st.LastError, "kill switch has been disarmed") {
+		t.Errorf("LastError = %q, does not tell the user the network is back", st.LastError)
+	}
+	// The whole point of the fall-back: the machine must not be left filtered
+	// with no tunnel to carry its traffic.
+	if env.ks.armed() {
+		t.Error("the kill switch was left armed after recovery failed — the machine would have no network")
+	}
+	if !env.lock.wasReleased() {
+		t.Error("the wake lock was left held after recovery failed")
+	}
+	if env.tun.interfaceUp() {
+		t.Error("the interface was left up after recovery failed")
+	}
+}
+
+func TestMonitorStaysOffWhenDisabled(t *testing.T) {
+	env := newTestDaemon(t, func(c *Config, _ *testEnv, _ *Deps) {
+		c.Monitor = false
+		c.MonitorInterval = 5 * time.Millisecond
+	})
+
+	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	env.tun.setRoute(wg.Route{Gateway: "192.168.1.1", Interface: "wlo1"})
+
+	time.Sleep(100 * time.Millisecond)
+	if up, _ := env.tun.calls(); up != 1 {
+		t.Errorf("Up called %d times, want 1 — the monitor ran despite being disabled", up)
+	}
+}
+
+func TestConnectStartsTheMonitorAndDisconnectStopsIt(t *testing.T) {
+	env := newTestDaemon(t, func(c *Config, _ *testEnv, _ *Deps) { monitorOn(c) })
+
+	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if !env.monitorRunning() {
+		t.Fatal("Connect did not start the health monitor")
+	}
+
+	if _, err := env.d.Disconnect(context.Background()); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	if env.monitorRunning() {
+		t.Error("Disconnect left the health monitor running for a tunnel that is gone")
+	}
+}
+
+func TestStatusDoesNotWaitForAnOperationInFlight(t *testing.T) {
+	env := newTestDaemon(t, nil)
+
+	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// Stand in for a connect or a recovery holding the operation lock for as
+	// long as it takes, which in the worst case is minutes. Status must not
+	// wait for it: someone running `myst status` while a reconnect grinds
+	// through its attempts is exactly the person who needs an answer.
+	env.d.opMu.Lock()
+	defer env.d.opMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := env.d.Status(context.Background()); err != nil {
+			t.Errorf("Status: %v", err)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Status blocked behind an operation in flight")
+	}
+}
+
+// monitorRunning reports whether a health monitor goroutine is registered.
+func (e *testEnv) monitorRunning() bool {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	return e.d.monitorCancel != nil
+}
+
 // trackingTunnel wraps a fakeTunnel to observe the order in which operations
 // happen. It goes on Deps.Tunnel; env.tun still points at the inner fake, so
 // the usual call-count assertions keep working.
@@ -547,6 +892,9 @@ func (t *trackingTunnel) IsUp(ctx context.Context) bool              { return t.
 func (t *trackingTunnel) ExitIP(ctx context.Context) (string, error) { return t.inner.ExitIP(ctx) }
 func (t *trackingTunnel) Handshake(ctx context.Context) (time.Time, error) {
 	return t.inner.Handshake(ctx)
+}
+func (t *trackingTunnel) DefaultRoute(ctx context.Context) (wg.Route, error) {
+	return t.inner.DefaultRoute(ctx)
 }
 
 // fieldValue pulls the right-hand side of the first `field = value` line.

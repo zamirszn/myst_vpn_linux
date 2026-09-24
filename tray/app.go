@@ -171,6 +171,12 @@ func (a *app) tooltipLocked() string {
 		return b.String()
 	case a.st.State == stateConnecting:
 		return "Mysterium VPN — connecting…"
+	case a.st.State == stateReconnecting:
+		msg := "Mysterium VPN — reconnecting…"
+		if a.st.LastError != "" {
+			msg += "\n" + a.st.LastError
+		}
+		return msg
 	case a.st.State == stateError:
 		msg := a.st.LastError
 		if msg == "" {
@@ -330,8 +336,11 @@ func (a *app) toggle() {
 	a.mu.Unlock()
 
 	switch {
-	case busy:
-		// Mid-operation; a second click should not queue another.
+	case busy || state == stateReconnecting:
+		// Mid-operation; a second click should not queue another. A reconnect
+		// the daemon started counts as mid-operation even though this process
+		// is idle: clicking Connect would race the recovery for the same
+		// tunnel, and clicking Disconnect would fight it.
 	case !reachable:
 		// There is nobody to ask. Starting a connect here would spend two
 		// minutes failing against a socket that is not answering, and would

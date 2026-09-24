@@ -33,6 +33,10 @@ type Tunnel interface {
 	IsUp(ctx context.Context) bool
 	Handshake(ctx context.Context) (time.Time, error)
 	ExitIP(ctx context.Context) (string, error)
+
+	// DefaultRoute reports the machine's own egress path, which is how the
+	// health monitor notices that the network underneath the tunnel changed.
+	DefaultRoute(ctx context.Context) (wg.Route, error)
 }
 
 // Provisioner is the control plane, bound to one access token.
@@ -74,6 +78,7 @@ func (WGTunnel) ExitIP(ctx context.Context) (string, error)      { return wg.Exi
 func (WGTunnel) Handshake(ctx context.Context) (time.Time, error) {
 	return wg.Handshake(ctx)
 }
+func (WGTunnel) DefaultRoute(ctx context.Context) (wg.Route, error) { return wg.DefaultRoute(ctx) }
 
 // Defaults applied where Config leaves a field zero.
 const (
@@ -84,6 +89,25 @@ const (
 	// DefaultHandshakeTimeout bounds how long we wait for positive evidence that
 	// the tunnel works before declaring success.
 	DefaultHandshakeTimeout = 10 * time.Second
+
+	// DefaultMonitorInterval is how often the health monitor inspects a live
+	// tunnel. Ten seconds is the resolution on noticing a drop, and the check
+	// itself is two cheap local commands.
+	DefaultMonitorInterval = 10 * time.Second
+
+	// DefaultStaleAfter is how old the last handshake may be before the tunnel
+	// is presumed dead. The config sets PersistentKeepalive = 25, so this is
+	// three and a half keepalive intervals: long enough that a busy or briefly
+	// idle machine does not produce false positives, short enough that a real
+	// drop is caught in well under two minutes.
+	DefaultStaleAfter = 90 * time.Second
+
+	// DefaultMaxRecoveryAttempts and DefaultRecoveryWindow bound the reconnect
+	// loop. Both are limits on the same thing from different angles — attempts
+	// caps the work, the window caps how long the user waits — and the first to
+	// run out ends it.
+	DefaultMaxRecoveryAttempts = 3
+	DefaultRecoveryWindow      = 2 * time.Minute
 )
 
 // Config is the daemon's tunable surface.
@@ -110,6 +134,25 @@ type Config struct {
 
 	// HandshakeTimeout bounds the wait for a first handshake.
 	HandshakeTimeout time.Duration
+
+	// Monitor runs a health check for as long as a tunnel is up, and reconnects
+	// when it finds the tunnel dead. Without it, a tunnel that dies on its own
+	// — a wifi change, a sleeping laptop, a node restart — goes unnoticed and
+	// the kill switch stays armed, which leaves the machine with no internet.
+	// Defaults on; cmd/mystd sets it from -no-monitor.
+	Monitor bool
+
+	// MonitorInterval is how often the tunnel is checked.
+	MonitorInterval time.Duration
+
+	// StaleAfter is how long the tunnel may go without a handshake before it is
+	// presumed dead.
+	StaleAfter time.Duration
+
+	// MaxRecoveryAttempts and RecoveryWindow bound a reconnect before it gives
+	// up and returns the network.
+	MaxRecoveryAttempts int
+	RecoveryWindow      time.Duration
 }
 
 // Deps are the daemon's collaborators. Tests substitute fakes here.
@@ -134,13 +177,52 @@ type Daemon struct {
 	ks     KillSwitch
 	log    *slog.Logger
 
-	// mu serialises the state machine. Connect is slow and touches global
-	// system state; two concurrent connects would race on the interface, the
-	// config file, and the account's connection.
+	// opMu serialises the lifecycle operations — Connect, Disconnect, Close and
+	// a monitor-driven recovery. Connect is slow and touches global system
+	// state; two concurrent connects would race on the interface, the config
+	// file, and the account's connection.
+	//
+	// It is held for as long as the operation takes, which can be minutes, so
+	// nothing a client waits on may take it. See mu.
+	opMu sync.Mutex
+
+	// mu guards the handful of fields below. It is never held across a network
+	// call, a filesystem call, or an exec, so Status answers in microseconds
+	// even while a connect or a recovery is in flight. That matters most
+	// exactly when things are going wrong: `myst status` blocking for two
+	// minutes during a failed reconnect is useless to the person running it.
+	//
+	// Lock order is opMu then mu, never the reverse.
 	mu     sync.Mutex
 	status ipc.Status
-	held   Lock
+
+	// held is the wake lock for the live tunnel, or nil.
+	held Lock
+
+	// monitorCancel stops the health monitor for the current connection. Nil
+	// when no monitor is running.
+	monitorCancel context.CancelFunc
+
+	// conn is the region the live tunnel serves, so a recovery reconnects to
+	// the same place rather than quietly landing the user in another country.
+	conn region
+
+	// baseline is the default route the tunnel came up on. A later change means
+	// the machine moved networks and the tunnel is dead.
+	baseline string
 }
+
+// region is a connection target, as the API understands it.
+type region struct {
+	country string
+	ipType  string
+}
+
+// teardown's keepWakeLock argument, named so the call sites state their intent.
+const (
+	releaseWakeLock = false
+	keepWakeLock    = true
+)
 
 // New returns a Daemon with defaults filled in.
 func New(cfg Config, deps Deps) *Daemon {
@@ -161,6 +243,18 @@ func New(cfg Config, deps Deps) *Daemon {
 	}
 	if cfg.HandshakeTimeout == 0 {
 		cfg.HandshakeTimeout = DefaultHandshakeTimeout
+	}
+	if cfg.MonitorInterval == 0 {
+		cfg.MonitorInterval = DefaultMonitorInterval
+	}
+	if cfg.StaleAfter == 0 {
+		cfg.StaleAfter = DefaultStaleAfter
+	}
+	if cfg.MaxRecoveryAttempts == 0 {
+		cfg.MaxRecoveryAttempts = DefaultMaxRecoveryAttempts
+	}
+	if cfg.RecoveryWindow == 0 {
+		cfg.RecoveryWindow = DefaultRecoveryWindow
 	}
 
 	if deps.Logger == nil {
@@ -211,38 +305,46 @@ func defaultLock(ctx context.Context, why string) (Lock, error) {
 // Connect brings the tunnel up, or returns the current status if it is already
 // up in the requested region.
 func (d *Daemon) Connect(ctx context.Context, country, ipType string) (*ipc.Status, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
 
-	if d.status.State == ipc.StateConnected {
-		if country == "" || country == d.status.Country {
+	// Any monitor belongs to the connection being replaced. Stopping it here
+	// rather than in teardown keeps the monitor from cancelling itself: a
+	// recovery runs inside the monitor goroutine and calls teardown too.
+	d.stopMonitor()
+
+	if st := d.snapshot(); st.State == ipc.StateConnected {
+		if country == "" || country == st.Country {
 			return d.snapshot(), nil // already there; connecting is idempotent
 		}
 		// A different region was asked for, so the current tunnel has to go.
-		if err := d.teardown(ctx); err != nil {
+		if err := d.teardown(ctx, releaseWakeLock); err != nil {
 			d.log.Warn("teardown before reconnect failed", "err", err)
 		}
 	}
 
-	d.status.State = ipc.StateConnecting
-	d.status.LastError = ""
+	d.setState(ipc.StateConnecting, "")
 
 	st, err := d.bringUp(ctx, country, ipType)
 	if err != nil {
 		// Roll back whatever did come up. A half-connected daemon is worse than
 		// a disconnected one: the interface may be carrying traffic with no
 		// wake lock, no accounting, and no way to disconnect it.
-		if cerr := d.teardown(ctx); cerr != nil {
+		if cerr := d.teardown(ctx, releaseWakeLock); cerr != nil {
 			d.log.Warn("rollback after failed connect", "err", cerr)
 		}
-		d.status = ipc.Status{
+		d.publish(ipc.Status{
 			State:     ipc.StateError,
 			LastError: err.Error(),
-		}
+		})
 		return d.snapshot(), err
 	}
 
-	d.status = *st
+	d.publish(*st)
+	d.noteTarget(st)
+	d.noteBaseline(ctx)
+	d.startMonitor()
+
 	d.log.Info("tunnel up",
 		"interface", st.Interface,
 		"exit_ip", st.ExitIP,
@@ -254,7 +356,7 @@ func (d *Daemon) Connect(ctx context.Context, country, ipType string) (*ipc.Stat
 	return d.snapshot(), nil
 }
 
-// bringUp performs the full connect sequence. Caller holds mu.
+// bringUp performs the full connect sequence. Caller holds opMu.
 func (d *Daemon) bringUp(ctx context.Context, country, ipType string) (*ipc.Status, error) {
 	tok, err := d.tokens.EnsureValid(ctx, d.store, d.cfg.RefreshMargin)
 	if err != nil {
@@ -327,7 +429,7 @@ func (d *Daemon) bringUp(ctx context.Context, country, ipType string) (*ipc.Stat
 			// Not fatal: the tunnel works, it is just vulnerable to suspend.
 			d.log.Warn("could not take a wake lock; the machine may sleep and drop the tunnel", "err", err)
 		} else {
-			d.held = lk
+			d.setHeld(lk)
 			wakeLock = true
 		}
 	}
@@ -432,28 +534,209 @@ func (d *Daemon) waitForHandshake(ctx context.Context) (time.Time, error) {
 	}
 }
 
+// --- health monitor ---------------------------------------------------------
+
+// startMonitor launches the health monitor for a tunnel that has just come up.
+// Caller holds opMu.
+//
+// The monitor runs on its own context, deliberately not the caller's. Connect
+// is invoked from an IPC call with a ninety-second budget, and a monitor that
+// died with the request would stop watching after a minute and a half — which
+// is precisely when a user has walked away and left the tunnel running.
+func (d *Daemon) startMonitor() {
+	if !d.cfg.Monitor {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	d.mu.Lock()
+	d.monitorCancel = cancel
+	d.mu.Unlock()
+
+	go d.monitor(ctx)
+}
+
+// stopMonitor stops the health monitor, if one is running. Caller holds opMu.
+// Safe to call when none is running, which is the common case.
+func (d *Daemon) stopMonitor() {
+	d.mu.Lock()
+	cancel := d.monitorCancel
+	d.monitorCancel = nil
+	d.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// monitor watches a live tunnel and repairs it, until its context is cancelled
+// by a disconnect, a new connect, or shutdown.
+func (d *Daemon) monitor(ctx context.Context) {
+	t := time.NewTicker(d.cfg.MonitorInterval)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+
+		reason, dead := d.tunnelDead(ctx)
+		if !dead {
+			continue
+		}
+		// A disconnect may have landed while this tick was in flight, in which
+		// case there is no longer a tunnel to repair.
+		if ctx.Err() != nil {
+			return
+		}
+		if keepWatching := d.recover(ctx, reason); !keepWatching {
+			return
+		}
+	}
+}
+
+// tunnelDead reports whether the live tunnel has stopped working, and why.
+//
+// Three signals, cheapest and most immediate first. The route check is what
+// catches the failure that motivated this monitor — a machine moving between
+// networks — within a single interval. The handshake check is the backstop for
+// everything else, including a node that goes away at the far end.
+func (d *Daemon) tunnelDead(ctx context.Context) (string, bool) {
+	// A WireGuard interface is virtual: it stays UP when the network beneath it
+	// disappears, so this catches only the interface being removed outright.
+	if !d.tun.IsUp(ctx) {
+		return fmt.Sprintf("%s is gone", d.cfg.Interface), true
+	}
+
+	// The default route changes the instant the network does, which is well
+	// before the handshake has had time to look stale.
+	if route, err := d.tun.DefaultRoute(ctx); err != nil {
+		// Failing to read the route is not evidence that the tunnel is down.
+		// Fall through to the handshake check rather than flapping on it.
+		d.log.Debug("cannot read the default route", "err", err)
+	} else if want := d.routeBaseline(); want != "" && route.String() != want {
+		return fmt.Sprintf("the default route changed from %s to %s", want, route), true
+	}
+
+	hs, err := d.tun.Handshake(ctx)
+	switch {
+	case err != nil:
+		return fmt.Sprintf("cannot read the handshake time: %v", err), true
+	case hs.IsZero():
+		// Connect waits for a handshake before reporting success, so a tunnel
+		// that has never handshaked lost its peer after we last looked.
+		return "the peer has stopped responding", true
+	case time.Since(hs) > d.cfg.StaleAfter:
+		return fmt.Sprintf("no handshake for %s", time.Since(hs).Round(time.Second)), true
+	}
+	return "", false
+}
+
+// recover repairs a tunnel the monitor found dead, and reports whether the
+// monitor should keep watching.
+//
+// Reconnect first, then fall back — the behaviour chosen when this was
+// designed. Retries are bounded by both attempt count and wall-clock time, and
+// when the budget runs out everything comes down, the kill switch included, and
+// the failure is reported. That fall-back is the guarantee that a dead tunnel
+// can never leave the machine without internet.
+func (d *Daemon) recover(ctx context.Context, reason string) bool {
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
+
+	if ctx.Err() != nil {
+		return false
+	}
+	if st := d.snapshot(); st.State != ipc.StateConnected {
+		// Something else moved the state while this recovery queued behind it:
+		// a disconnect, or a status check that gave up on the tunnel already.
+		return false
+	}
+
+	d.log.Warn("the tunnel has stopped working; reconnecting", "reason", reason)
+	d.setState(ipc.StateReconnecting, reason)
+
+	target := d.target()
+	deadline := time.Now().Add(d.cfg.RecoveryWindow)
+	var lastErr error
+
+	for attempt := 1; attempt <= d.cfg.MaxRecoveryAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return false
+		}
+		if time.Now().After(deadline) {
+			lastErr = fmt.Errorf("the %s recovery window expired", d.cfg.RecoveryWindow)
+			break
+		}
+
+		d.log.Info("recovery attempt", "attempt", attempt, "of", d.cfg.MaxRecoveryAttempts)
+
+		// Clear the dead tunnel's remains before building a new one, so the
+		// interface, the account's connection and the filter all start clean.
+		// The wake lock stays held: letting the machine suspend here would
+		// strand the recovery half-done.
+		if err := d.teardown(ctx, keepWakeLock); err != nil {
+			d.log.Warn("could not fully clear the dead tunnel", "err", err)
+		}
+
+		st, err := d.bringUp(ctx, target.country, target.ipType)
+		if err == nil {
+			d.publish(*st)
+			d.noteBaseline(ctx)
+			d.log.Info("tunnel recovered",
+				"attempt", attempt, "exit_ip", st.ExitIP, "country", st.Country)
+			return true
+		}
+
+		lastErr = err
+		d.log.Warn("recovery attempt failed", "attempt", attempt, "err", err)
+	}
+
+	// Out of budget. Hand the network back rather than leaving the machine
+	// filtered with nothing to carry its traffic.
+	d.log.Error("could not restore the tunnel; returning the network", "err", lastErr)
+
+	msg := fmt.Sprintf(
+		"the tunnel dropped (%s) and could not be restored after %d attempts: %v. "+
+			"The kill switch has been disarmed, so the network works again, but traffic is no longer going through Mysterium.",
+		reason, d.cfg.MaxRecoveryAttempts, lastErr)
+	if err := d.teardown(ctx, releaseWakeLock); err != nil {
+		msg += fmt.Sprintf(" Teardown also reported: %v", err)
+	}
+	d.publish(ipc.Status{State: ipc.StateError, LastError: msg})
+	return false
+}
+
 // Disconnect tears the tunnel down.
 func (d *Daemon) Disconnect(ctx context.Context) (*ipc.Status, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
 
-	err := d.teardown(ctx)
-	d.status = ipc.Status{State: ipc.StateDisconnected}
+	d.stopMonitor()
+
+	err := d.teardown(ctx, releaseWakeLock)
+	d.publish(ipc.Status{State: ipc.StateDisconnected})
 	if err != nil {
-		d.status.State = ipc.StateError
-		d.status.LastError = err.Error()
+		st := ipc.Status{State: ipc.StateError, LastError: err.Error()}
+		d.publish(st)
 		return d.snapshot(), err
 	}
 	d.log.Info("tunnel down")
 	return d.snapshot(), nil
 }
 
-// teardown undoes a connection. Caller holds mu.
+// teardown undoes a connection. Caller holds opMu.
 //
 // Every step runs even if an earlier one fails, and the failures are joined:
 // stopping at the first error would leave the account holding a connection, or
 // a private key on disk, purely because the interface happened to be stubborn.
-func (d *Daemon) teardown(ctx context.Context) error {
+//
+// It deliberately does not touch the health monitor, because a recovery calls
+// it from inside the monitor goroutine and stopping the monitor there would
+// cancel the recovery itself. Connect, Disconnect and Close stop it instead.
+func (d *Daemon) teardown(ctx context.Context, wakeLock bool) error {
 	var errs []error
 
 	if d.tun.IsUp(ctx) {
@@ -462,9 +745,13 @@ func (d *Daemon) teardown(ctx context.Context) error {
 		}
 	}
 
-	if d.held != nil {
-		d.held.Release()
-		d.held = nil
+	// A recovery passes keepWakeLock: the machine must not be free to suspend
+	// in the middle of a reconnect, and holding the lock a few seconds longer
+	// costs nothing.
+	if wakeLock == releaseWakeLock {
+		if lk := d.takeHeld(); lk != nil {
+			lk.Release()
+		}
 	}
 
 	// Disarm only after the interface is down. Removing the filter first would
@@ -495,22 +782,15 @@ func (d *Daemon) teardown(ctx context.Context) error {
 
 // Status reports the current state, reconciled against reality.
 func (d *Daemon) Status(ctx context.Context) (*ipc.Status, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	// The interface can vanish without us — a manual `wg-quick down`, a module
-	// unload, a killed process. Reporting "connected" after that would be a lie,
-	// and the wake lock would be held for a tunnel that no longer exists.
-	if d.status.State == ipc.StateConnected && !d.tun.IsUp(ctx) {
+	// Cheap check first: reading the published state takes the short lock, so
+	// the common case costs nothing and cannot be blocked by a connect.
+	if st := d.snapshot(); st.State == ipc.StateConnected && !d.tun.IsUp(ctx) {
+		// The interface can vanish without us — a manual `wg-quick down`, a
+		// module unload, a killed process. Reporting "connected" after that
+		// would be a lie, and worse, the kill switch would stay armed with no
+		// tunnel behind it.
 		d.log.Warn("interface disappeared while we believed it was up", "interface", d.cfg.Interface)
-		if d.held != nil {
-			d.held.Release()
-			d.held = nil
-		}
-		d.status = ipc.Status{
-			State:     ipc.StateError,
-			LastError: fmt.Sprintf("%s disappeared — the tunnel dropped outside the daemon", d.cfg.Interface),
-		}
+		d.abandon(ctx, fmt.Sprintf("%s disappeared — the tunnel dropped outside the daemon", d.cfg.Interface))
 	}
 
 	return d.snapshot(), nil
@@ -518,12 +798,110 @@ func (d *Daemon) Status(ctx context.Context) (*ipc.Status, error) {
 
 // Close tears everything down. Intended for graceful shutdown.
 func (d *Daemon) Close(ctx context.Context) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.teardown(ctx)
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
+
+	d.stopMonitor()
+	return d.teardown(ctx, releaseWakeLock)
 }
 
+// abandon gives up on a tunnel that died outside the daemon's control.
+//
+// This is the fall-back that keeps the original failure from recurring: the
+// alternative is a kill switch left armed with nothing behind it, which drops
+// every packet and reads to the user as a broken network card. Caller must hold
+// neither opMu nor mu.
+func (d *Daemon) abandon(ctx context.Context, reason string) {
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
+
+	// Re-check under the lock. Whoever held it may have already dealt with this
+	// — or replaced the dead tunnel with a working one.
+	if st := d.snapshot(); st.State != ipc.StateConnected {
+		return
+	}
+
+	d.stopMonitor()
+	if err := d.teardown(ctx, releaseWakeLock); err != nil {
+		d.log.Warn("teardown after the tunnel vanished", "err", err)
+		reason += fmt.Sprintf(" (teardown also reported: %v)", err)
+	}
+	d.publish(ipc.Status{State: ipc.StateError, LastError: reason})
+}
+
+// --- status accessors -------------------------------------------------------
+//
+// Every one of these takes mu and releases it immediately. They exist so no
+// caller has to remember which of the two locks guards which field.
+
 func (d *Daemon) snapshot() *ipc.Status {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	st := d.status
 	return &st
+}
+
+// publish replaces the whole published status.
+func (d *Daemon) publish(st ipc.Status) {
+	d.mu.Lock()
+	d.status = st
+	d.mu.Unlock()
+}
+
+// setState moves the state machine without disturbing the rest of the status.
+func (d *Daemon) setState(state ipc.State, lastErr string) {
+	d.mu.Lock()
+	d.status.State = state
+	d.status.LastError = lastErr
+	d.mu.Unlock()
+}
+
+func (d *Daemon) setHeld(lk Lock) {
+	d.mu.Lock()
+	d.held = lk
+	d.mu.Unlock()
+}
+
+// takeHeld removes and returns the wake lock, so the caller can release it
+// without holding mu across whatever Release does.
+func (d *Daemon) takeHeld() Lock {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	lk := d.held
+	d.held = nil
+	return lk
+}
+
+// noteTarget records the region the live tunnel serves.
+func (d *Daemon) noteTarget(st *ipc.Status) {
+	d.mu.Lock()
+	d.conn = region{country: st.Country, ipType: st.IPType}
+	d.mu.Unlock()
+}
+
+func (d *Daemon) target() region {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.conn
+}
+
+// noteBaseline records the default route the tunnel came up on, so the monitor
+// can tell later that the machine has moved networks.
+func (d *Daemon) noteBaseline(ctx context.Context) {
+	route, err := d.tun.DefaultRoute(ctx)
+	if err != nil {
+		// Without a baseline the route check simply cannot fire; the handshake
+		// check still covers the tunnel. Not worth failing a connect over.
+		d.log.Debug("cannot record the default route for the health monitor", "err", err)
+		return
+	}
+	d.mu.Lock()
+	d.baseline = route.String()
+	d.mu.Unlock()
+}
+
+func (d *Daemon) routeBaseline() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.baseline
 }

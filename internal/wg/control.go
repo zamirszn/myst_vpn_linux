@@ -2,6 +2,7 @@ package wg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -86,6 +87,62 @@ func lookupIP(ctx context.Context, url string) (string, error) {
 		return "", fmt.Errorf("read exit IP: %w", err)
 	}
 	return strings.TrimSpace(string(body)), nil
+}
+
+// Route is the machine's default egress path.
+type Route struct {
+	Gateway   string
+	Interface string
+}
+
+// String renders the route for logs and for storing a comparison baseline.
+func (r Route) String() string { return r.Gateway + " dev " + r.Interface }
+
+// DefaultRoute reports the current default gateway and the device carrying it.
+//
+// This exists to detect a network change quickly. A WireGuard interface is
+// virtual: when the machine moves between wifi networks the tunnel dies, but the
+// interface stays UP and keeps answering, so IsUp is useless and the handshake
+// timestamp takes a keepalive interval or more to look stale. The underlying
+// default route, by contrast, changes the instant the network does — which is
+// the difference between recovering in ten seconds and stranding the user for
+// two minutes.
+func DefaultRoute(ctx context.Context) (Route, error) {
+	cmd := exec.CommandContext(ctx, "ip", "route", "show", "default")
+	out, err := cmd.Output()
+	if err != nil {
+		return Route{}, fmt.Errorf("ip route show default: %w", err)
+	}
+	return parseDefaultRoute(string(out))
+}
+
+// parseDefaultRoute reads the gateway and device out of output such as:
+//
+//	default via 10.0.0.1 dev wlo1 proto dhcp src 10.0.115.27 metric 600
+//
+// The first line naming a device wins, so a host with several default routes
+// still produces a stable answer as long as the kernel's ordering is stable.
+func parseDefaultRoute(out string) (Route, error) {
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		var r Route
+		for i, f := range fields {
+			switch f {
+			case "via":
+				if i+1 < len(fields) {
+					r.Gateway = fields[i+1]
+				}
+			case "dev":
+				if i+1 < len(fields) {
+					r.Interface = fields[i+1]
+				}
+			}
+		}
+		if r.Interface != "" {
+			return r, nil
+		}
+	}
+	return Route{}, errors.New("no default route")
 }
 
 func run(ctx context.Context, name string, args ...string) error {

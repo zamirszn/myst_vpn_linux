@@ -133,7 +133,7 @@ func (m *menuMethods) buildLocked() layoutItem {
 	a := m.a
 
 	connected := a.st.State == stateConnected
-	connecting := a.st.State == stateConnecting
+	connecting := a.st.State == stateConnecting || a.st.State == stateReconnecting
 	busy := a.busy || connecting
 
 	root := layoutItem{ID: 0, Properties: map[string]dbus.Variant{}, Children: []dbus.Variant{}}
@@ -193,6 +193,15 @@ func statusLine(a *app) string {
 		return line
 	case a.st.State == stateConnecting:
 		return "Connecting…"
+	case a.st.State == stateReconnecting:
+		// The daemon noticed the tunnel die and is repairing it on its own.
+		// Saying so matters: without it the user sees a connected-looking
+		// client and a network that does not work.
+		line := "Reconnecting…"
+		if a.st.LastError != "" {
+			line += " (" + a.st.LastError + ")"
+		}
+		return line
 	case a.st.State == stateError:
 		if a.st.LastError != "" {
 			return "Error — " + a.st.LastError

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -187,5 +188,37 @@ func TestLookupGIDAcceptsNamesAndNumbers(t *testing.T) {
 
 	if _, err := lookupGID("no-such-group-myst-test"); err == nil {
 		t.Error("expected an error for a group that does not exist")
+	}
+}
+
+// TestTrayKnowsEveryState guards the one duplication the module split forces.
+//
+// The tray is a separate Go module and cannot import this package, so it
+// restates the state vocabulary in tray/ipc.go as plain strings. Nothing in the
+// compiler connects the two: add a state here, forget it there, and the tray
+// renders it as disconnected — a client that looks idle while the tunnel is in
+// fact reconnecting or broken.
+//
+// The check is on the wire *values*, not the constant names, because the value
+// is what actually crosses the socket.
+func TestTrayKnowsEveryState(t *testing.T) {
+	const traySource = "../../tray/ipc.go"
+
+	raw, err := os.ReadFile(traySource)
+	if err != nil {
+		t.Fatalf("read %s: %v", traySource, err)
+	}
+
+	states := []State{
+		StateDisconnected,
+		StateConnecting,
+		StateConnected,
+		StateReconnecting,
+		StateError,
+	}
+	for _, st := range states {
+		if !strings.Contains(string(raw), `"`+string(st)+`"`) {
+			t.Errorf("tray/ipc.go does not know the %q state — the tray would render it as disconnected", st)
+		}
 	}
 }

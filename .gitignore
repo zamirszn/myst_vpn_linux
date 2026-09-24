@@ -30,3 +30,5 @@ node_modules/
 /myst
 /mystd
 /tray/myst-tray
+# `go build ./...` inside the tray module names the binary after its directory.
+/tray/tray

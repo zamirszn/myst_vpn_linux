@@ -458,6 +458,59 @@ traffic can still leave in the clear when the tunnel drops. The filter is also
 egress-only: unsolicited inbound is not filtered, which is the same posture as
 having no kill switch, since nothing but the handshake is listening.
 
+### The health monitor
+
+A tunnel can die without the daemon being told. The wifi changes, the laptop
+resumes, the node restarts. A WireGuard interface is *virtual*, so it stays `UP`
+and keeps answering `ip link show` while carrying nothing at all — which means
+the daemon cannot tell the difference between a working tunnel and a dead one by
+looking at the interface.
+
+Left alone, that was worse than it sounds. The daemon went on reporting
+`connected`, so the kill switch stayed armed. By design it drops everything that
+is not the tunnel, so the machine lost its network entirely and looked like a
+broken wifi card rather than a dropped VPN.
+
+`mystd` now watches a live tunnel and repairs it. Three signals, cheapest first:
+
+| Signal | Catches | Noticed within |
+| --- | --- | --- |
+| Default route changed | the machine moving between networks | one poll |
+| Interface gone | `wg-quick down`, module unload, killed process | one poll |
+| No handshake for 90s | a node that stopped answering, resume from suspend | ~3 keepalive intervals |
+
+The route check is the one that matters in practice. It records `ip route show
+default` when the tunnel comes up and compares on every poll; a different gateway
+means the tunnel is already dead, and it says so at once instead of waiting for
+`PersistentKeepalive = 25` to make the handshake look stale a minute later.
+
+When a signal fires the state becomes `reconnecting`, and the daemon rebuilds the
+tunnel for **the same region** — a recovery must not quietly move you to another
+country. Attempts are bounded by both count and wall-clock time (3 attempts, two
+minutes), and the wake lock is held throughout, so the machine cannot suspend
+halfway through a reconnect.
+
+**When recovery runs out of budget, the network is handed back.** The daemon
+tears everything down — interface, kill switch, wake lock — and reports an error
+saying plainly that the tunnel is gone and the network is working again. That
+fall-back is the whole point: a dead tunnel can cost you a few seconds of
+connectivity, but it can no longer cost you your connectivity indefinitely.
+
+The same fall-back covers a tunnel that vanishes while nobody is looking. If
+`myst status` finds the interface gone, it disarms the filter too, rather than
+only releasing the wake lock — the older behaviour, and the other route to the
+same stranding.
+
+Disable it with `mystd -no-monitor`. The checks are two local commands every ten
+seconds, so there is little reason to.
+
+`myst status` stays responsive throughout, which took some doing. The daemon
+holds one lock across a whole connect — minutes, in the worst case — so a status
+read that shared it would block for exactly as long as the operation a user most
+wants to ask about. The status snapshot is therefore published under a separate,
+short-lived lock, and a test holds the operation lock and asserts that `Status`
+returns anyway.
+
 ### What was already true on this machine
 
 `mystd` is **not** what keeps this box awake. It was already configured that way,

@@ -52,6 +52,12 @@ const (
 	StateConnecting   State = "connecting"
 	StateConnected    State = "connected"
 	StateError        State = "error"
+
+	// StateReconnecting is the daemon recovering from a tunnel it watched die,
+	// as opposed to StateConnecting, which is a user asking for a tunnel. The
+	// distinction is worth keeping: one means "wait a moment", the other means
+	// "something went wrong and I am fixing it", and a UI should say so.
+	StateReconnecting State = "reconnecting"
 )
 
 // Status is the daemon's view of the world, returned by every command so a

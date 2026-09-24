@@ -38,6 +38,7 @@ func run() error {
 		noWakeLock   = flag.Bool("no-wakelock", false, "allow the machine to suspend while connected")
 		noIPv6       = flag.Bool("no-ipv6", false, "do not route IPv6 through the tunnel (leaks on IPv6 hosts)")
 		noKillSwitch = flag.Bool("no-killswitch", false, "do not block traffic outside the tunnel when it drops")
+		noMonitor    = flag.Bool("no-monitor", false, "do not watch a live tunnel for drops and reconnect it")
 		verbose      = flag.Bool("v", false, "verbose logging")
 	)
 	flag.Parse()
@@ -61,6 +62,7 @@ func run() error {
 		IPv6:       !*noIPv6,
 		WakeLock:   !*noWakeLock,
 		KillSwitch: !*noKillSwitch,
+		Monitor:    !*noMonitor,
 	}, daemon.Deps{Logger: log})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
