@@ -279,6 +279,15 @@ myst disconnect
 
 Log out and back in once, so the new group membership takes effect.
 
+**Rebuild and re-install `mystd` whenever its flags change.** The unit file and
+the binary are installed independently, so it is possible to edit `ExecStart` to
+pass a flag the installed binary predates. Go's `flag` package rejects an unknown
+flag with exit status 2, and the unit then crash-loops every `RestartSec`.
+`systemctl status` reports `activating (auto-restart)`, which reads like a
+startup failure rather than a stale binary — check
+`strings /usr/local/bin/mystd | grep <flag>` when a daemon refuses to start right
+after a unit change.
+
 `myst login --from <token.json>` imports a captured token so the client can
 authenticate without a browser. Credentials land in `/var/lib/mystd/token.json`
 at 0600. The magic-link/PKCE flow is not yet implemented.
@@ -308,7 +317,29 @@ to root-only — a typo should not look like a working daemon.
 
 ```
 cd tray && go build -o myst-tray .
+sudo install -m755 myst-tray /usr/local/bin/
 ```
+
+To have it come up with the session, drop an autostart entry in place:
+
+```sh
+cat > ~/.config/autostart/myst-tray.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Mysterium VPN
+Comment=System tray applet for the Mysterium VPN daemon
+Exec=/usr/local/bin/myst-tray
+Icon=network-vpn
+Terminal=false
+Categories=Network;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+EOF
+```
+
+The applet reaches the daemon through the control socket, so the session needs
+the `myst` group — **log out and back in after `usermod`**, or every action fails
+with `permission denied` against a daemon that looks perfectly healthy.
 
 A shield in the system tray, filled by state:
 
@@ -458,10 +489,17 @@ forwarded traffic — containers, VMs on a bridge — is not covered. Closing th
 means adding a forward chain, which risks breaking Docker's networking and has
 not been attempted here.
 
-**The kill switch has been parsed, not loaded.** The generated ruleset is
-checked against the real `nft` parser in tests, which catches syntax errors, but
-loading it into a live kernel needs root and had not been done when this was
-written. Syntax-clean is not the same as correct.
+**The kill switch loads, but its blocking has never been provoked.** Verified on
+a live kernel (Ubuntu, 6.11) on 2026-09-24: `myst connect` arms the table, the
+tunnel establishes with the endpoint still reachable *through* the filter, and
+`myst disconnect` removes the table — leaving the public IP back at its
+pre-connect value and DNS working. That covers installation, the endpoint
+exemption, and teardown.
+
+What that does **not** cover is the case the switch exists for. The tunnel was
+never dropped while the switch was armed, so the `counter drop` rule has not been
+observed dropping a packet. "It loads and does not break the tunnel" is a
+different claim from "it blocks the leak", and only the first has been shown.
 
 **The tray needs a StatusNotifier host.** On GNOME that means the AppIndicator
 extension; without it the applet exits with an explanation rather than running
