@@ -31,6 +31,7 @@ func main() {
 func run() error {
 	var (
 		socket       = flag.String("socket", ipc.DefaultSocketPath, "unix socket to listen on")
+		socketGroup  = flag.String("socket-group", "", "group allowed to drive the daemon (default: root only)")
 		configPath   = flag.String("config", daemon.DefaultConfigPath, "WireGuard config path")
 		tokenPath    = flag.String("token", daemon.DefaultTokenPath, "credential store path")
 		baseURL      = flag.String("api", "", "override the API base URL")
@@ -65,11 +66,18 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	srv := &ipc.Server{Path: *socket, Handler: d}
+	srv := &ipc.Server{Path: *socket, Handler: d, Group: *socketGroup}
 	if err := srv.Listen(); err != nil {
 		return err
 	}
 	log.Info("listening", "socket", *socket)
+	if *socketGroup == "" {
+		// Say so plainly rather than letting the operator discover it as a
+		// "permission denied" from a client that looks like it should work.
+		log.Info("control socket is root-only; pass -socket-group to let a desktop user drive the daemon")
+	} else {
+		log.Info("control socket group", "group", *socketGroup)
+	}
 
 	// Clear anything a previous run left behind. A hard kill between arming the
 	// filter and bringing the tunnel up would otherwise leave the machine with

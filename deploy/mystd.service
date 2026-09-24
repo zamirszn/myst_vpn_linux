@@ -10,6 +10,20 @@ ExecStart=/usr/local/bin/mystd
 Restart=on-failure
 RestartSec=5
 
+# The control socket is created root:root 0660, so by default only root can
+# drive the daemon. To let a desktop user — and the tray applet — talk to it,
+# create a group and name it on the command line:
+#
+#   sudo groupadd --system myst
+#   sudo usermod -aG myst "$USER"     # log out and back in for this to apply
+#
+# then change ExecStart to:
+#
+#   ExecStart=/usr/local/bin/mystd -socket-group myst
+#
+# mystd refuses to start if the group is named but does not exist, rather than
+# quietly falling back to root-only.
+
 # A system service, not a --user one: it must survive desktop logout, and it
 # needs root for the TUN device and the routing table in any case.
 #

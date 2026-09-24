@@ -20,7 +20,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -102,6 +104,11 @@ type Server struct {
 	Path    string
 	Handler Handler
 
+	// Group is the group given ownership of the socket, as a name or a numeric
+	// GID. It may be left empty, but see applyGroup for why it usually should
+	// not be.
+	Group string
+
 	ln net.Listener
 }
 
@@ -129,8 +136,54 @@ func (s *Server) Listen() error {
 		ln.Close()
 		return fmt.Errorf("chmod socket: %w", err)
 	}
+	if err := s.applyGroup(); err != nil {
+		ln.Close()
+		return err
+	}
 	s.ln = ln
 	return nil
+}
+
+// applyGroup hands the socket to the configured group.
+//
+// The daemon runs as root, so a socket it creates belongs to root:root. Mode
+// 0660 then means only root can open it — which would leave the unprivileged
+// CLI and the tray applet unable to reach the one thing they exist to talk to.
+//
+// The mode is deliberately not widened to 0666 instead. Anything that can open
+// this socket can bring a root process to bring a tunnel up and down, so access
+// is granted by group membership rather than to every account on the machine.
+func (s *Server) applyGroup() error {
+	if s.Group == "" {
+		return nil
+	}
+	gid, err := lookupGID(s.Group)
+	if err != nil {
+		return fmt.Errorf("socket group %q: %w", s.Group, err)
+	}
+	// -1 leaves the owner alone. Passing 0 here would be a request to reset the
+	// owner to root as well, which is not what this means and which fails
+	// outright for any caller that is not already root.
+	if err := os.Chown(s.Path, -1, gid); err != nil {
+		return fmt.Errorf("chown socket to group %q: %w", s.Group, err)
+	}
+	return nil
+}
+
+// lookupGID accepts either a numeric GID or a group name.
+//
+// Names resolve through os/user, which reads /etc/group. That covers a local
+// system group, which is what this is for; a group that exists only in LDAP or
+// SSSD would need the numeric form.
+func lookupGID(group string) (int, error) {
+	if n, err := strconv.Atoi(group); err == nil {
+		return n, nil
+	}
+	g, err := user.LookupGroup(group)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(g.Gid)
 }
 
 // Serve accepts connections until the context is cancelled.
