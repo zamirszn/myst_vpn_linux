@@ -1,0 +1,17 @@
+# ---- credentials and captured session data: never commit ----
+.myst-env
+.myst-capture/
+tokens.json
+token-from-browser.json
+proxy-config.json
+requests.ndjson
+magic-code.txt
+profile/
+*.token
+*.pem
+*.key
+
+# ---- runtime noise ----
+*.log
+node_modules/
+.DS_Store
