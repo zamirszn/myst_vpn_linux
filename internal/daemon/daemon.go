@@ -591,10 +591,59 @@ func (d *Daemon) monitor(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if keepWatching := d.recover(ctx, reason); !keepWatching {
+		// Claim before doing any work. A status poll that noticed the same dead
+		// tunnel a moment ago will have claimed it already, and in that case
+		// there is nothing for this tick to do but keep watching.
+		if !d.claimDeadTunnel(reason) {
+			// Someone else owns the recovery. If the state they left behind is
+			// terminal then the tunnel is gone for good and there is nothing
+			// left to watch.
+			switch d.snapshot().State {
+			case ipc.StateDisconnected, ipc.StateError:
+				return
+			}
+			continue
+		}
+		if keepWatching := d.rebuild(ctx, reason); !keepWatching {
 			return
 		}
 	}
+}
+
+// claimDeadTunnel moves a live connection into the reconnecting state and
+// reports whether this caller is the one that claimed it.
+//
+// Only "connected" can be claimed, which is what stops two callers starting a
+// recovery for the same dead tunnel. That is not hypothetical: a user running
+// `myst status` in a loop would otherwise launch a recovery per poll, and each
+// one would tear down whatever the last had just built.
+func (d *Daemon) claimDeadTunnel(reason string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.status.State != ipc.StateConnected {
+		return false
+	}
+	d.status.State = ipc.StateReconnecting
+	d.status.LastError = reason
+	return true
+}
+
+// recoverDetached rebuilds a tunnel that a status check found already dead.
+//
+// A status check cannot do the work itself — it has to answer in microseconds,
+// and a recovery can take two minutes — so it hands off to this. Doing it here
+// rather than waiting for the monitor matters when the monitor is disabled:
+// that is a supported configuration, and it must not become the one where a
+// vanished interface leaves the machine filtered with nothing behind it.
+//
+// The context is fresh rather than the caller's, because the caller's is
+// cancelled the moment it answers.
+func (d *Daemon) recoverDetached(reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), d.cfg.RecoveryWindow+time.Minute)
+	defer cancel()
+
+	d.rebuild(ctx, reason)
 }
 
 // tunnelDead reports whether the live tunnel has stopped working, and why.
@@ -642,21 +691,38 @@ func (d *Daemon) tunnelDead(ctx context.Context) (string, bool) {
 // when the budget runs out everything comes down, the kill switch included, and
 // the failure is reported. That fall-back is the guarantee that a dead tunnel
 // can never leave the machine without internet.
-func (d *Daemon) recover(ctx context.Context, reason string) bool {
+// rebuild replaces a tunnel that has already been claimed as dead, and reports
+// whether the monitor should keep watching afterwards.
+//
+// The caller must have claimed it through claimDeadTunnel. That claim, not this
+// function, is what guarantees a single recovery is in flight — which is why
+// there is no "is it really dead?" test here: by the time anyone gets this far
+// the answer is yes, and asking again would only open a window for a second
+// caller to slip in behind.
+func (d *Daemon) rebuild(ctx context.Context, reason string) bool {
 	d.opMu.Lock()
 	defer d.opMu.Unlock()
 
 	if ctx.Err() != nil {
 		return false
 	}
-	if st := d.snapshot(); st.State != ipc.StateConnected {
-		// Something else moved the state while this recovery queued behind it:
-		// a disconnect, or a status check that gave up on the tunnel already.
+
+	// The claim happened before this took opMu, so the world may have moved on
+	// while it queued: the user may have disconnected, or connected somewhere
+	// else. Re-check what we are actually holding.
+	switch d.snapshot().State {
+	case ipc.StateReconnecting:
+		// Ours to finish.
+	case ipc.StateConnected:
+		// Someone rebuilt it while this waited. Nothing to do, keep watching.
+		return true
+	default:
+		// Disconnected or already given up. Either way there is no tunnel to
+		// watch any more.
 		return false
 	}
 
 	d.log.Warn("the tunnel has stopped working; reconnecting", "reason", reason)
-	d.setState(ipc.StateReconnecting, reason)
 
 	target := d.target()
 	deadline := time.Now().Add(d.cfg.RecoveryWindow)
@@ -789,8 +855,18 @@ func (d *Daemon) Status(ctx context.Context) (*ipc.Status, error) {
 		// module unload, a killed process. Reporting "connected" after that
 		// would be a lie, and worse, the kill switch would stay armed with no
 		// tunnel behind it.
-		d.log.Warn("interface disappeared while we believed it was up", "interface", d.cfg.Interface)
-		d.abandon(ctx, fmt.Sprintf("%s disappeared — the tunnel dropped outside the daemon", d.cfg.Interface))
+		reason := fmt.Sprintf("%s disappeared — the tunnel dropped outside the daemon", d.cfg.Interface)
+		if d.claimDeadTunnel(reason) {
+			d.log.Warn("interface disappeared while we believed it was up", "interface", d.cfg.Interface)
+			// Repair, do not give up. An earlier version tore the connection
+			// down here, on the theory that a tunnel which died outside the
+			// daemon was beyond saving — but this is the *safety net*, and the
+			// monitor that would otherwise rebuild it ticks on a 10s timer, so
+			// a user polling status during a drop would destroy the recovery
+			// seconds before it started. Hand off instead, and let rebuild
+			// decide whether to reconnect or fall back.
+			go d.recoverDetached(reason)
+		}
 	}
 
 	return d.snapshot(), nil
@@ -803,30 +879,6 @@ func (d *Daemon) Close(ctx context.Context) error {
 
 	d.stopMonitor()
 	return d.teardown(ctx, releaseWakeLock)
-}
-
-// abandon gives up on a tunnel that died outside the daemon's control.
-//
-// This is the fall-back that keeps the original failure from recurring: the
-// alternative is a kill switch left armed with nothing behind it, which drops
-// every packet and reads to the user as a broken network card. Caller must hold
-// neither opMu nor mu.
-func (d *Daemon) abandon(ctx context.Context, reason string) {
-	d.opMu.Lock()
-	defer d.opMu.Unlock()
-
-	// Re-check under the lock. Whoever held it may have already dealt with this
-	// — or replaced the dead tunnel with a working one.
-	if st := d.snapshot(); st.State != ipc.StateConnected {
-		return
-	}
-
-	d.stopMonitor()
-	if err := d.teardown(ctx, releaseWakeLock); err != nil {
-		d.log.Warn("teardown after the tunnel vanished", "err", err)
-		reason += fmt.Sprintf(" (teardown also reported: %v)", err)
-	}
-	d.publish(ipc.Status{State: ipc.StateError, LastError: reason})
 }
 
 // --- status accessors -------------------------------------------------------

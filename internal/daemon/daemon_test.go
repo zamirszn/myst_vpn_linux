@@ -624,23 +624,81 @@ func TestStatusDetectsVanishedInterface(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Status: %v", err)
 	}
-	if st.State != ipc.StateError {
-		t.Errorf("state = %q, want %q — a vanished interface must not read as connected", st.State, ipc.StateError)
+	// The answer must be immediate and honest: the tunnel is gone, and the
+	// daemon is doing something about it rather than reporting a connection it
+	// no longer has.
+	if st.State != ipc.StateReconnecting {
+		t.Fatalf("state = %q, want %q — a vanished interface must not read as connected", st.State, ipc.StateReconnecting)
 	}
 	if st.LastError == "" {
 		t.Error("no explanation was recorded for the dropped tunnel")
 	}
-	if !env.lock.wasReleased() {
-		t.Error("the wake lock was held for a tunnel that no longer exists")
+
+	// The repair happens off the request, so its result is waited for rather
+	// than returned.
+	waitFor(t, 5*time.Second, "the vanished interface to be rebuilt", func() bool {
+		return env.d.snapshot().State == ipc.StateConnected
+	})
+
+	if up, _ := env.tun.calls(); up < 2 {
+		t.Errorf("the interface was brought up %d times, want at least 2 — it was never rebuilt", up)
 	}
-	// Releasing the wake lock is not enough, and this is the regression that
-	// mattered: an armed filter with no tunnel behind it drops every packet, so
-	// the machine looks like it has broken wifi rather than a dropped VPN.
-	if env.ks.armed() {
-		t.Error("the kill switch was left armed after the tunnel vanished — the machine would have no network")
+	if !env.tun.interfaceUp() {
+		t.Error("the interface is still down")
 	}
-	if env.ks.removeCount() == 0 {
-		t.Error("the kill switch was never disarmed")
+	// A rebuilt tunnel gets its filter back. The old code disarmed the switch
+	// and gave up, which fixed the stranding by throwing the tunnel away; the
+	// fix must not swing the other way and leave a tunnel unguarded.
+	if !env.ks.armed() {
+		t.Error("the kill switch was not re-armed over the rebuilt tunnel")
+	}
+	// A recovery holds the wake lock throughout, or the machine can suspend
+	// between the teardown and the rebuild and never wake up connected.
+	if env.lock.wasReleased() {
+		t.Error("the wake lock was released mid-recovery")
+	}
+}
+
+// TestStatusDoesNotPreemptTheMonitor is the regression for the bug the live
+// drop test found.
+//
+// Polling the status during a drop used to open the give-up path: the daemon
+// tore the connection down and published an error. The monitor ticks on a
+// ten-second timer, so anyone watching the state — the first thing a person
+// does when the network stops working — destroyed the recovery seconds before
+// it would have started, and the machine was left with no tunnel.
+func TestStatusDoesNotPreemptTheMonitor(t *testing.T) {
+	env := newTestDaemon(t, func(c *Config, _ *testEnv, _ *Deps) {
+		monitorOn(c)
+		// A realistic interval: long enough that the poll below lands first,
+		// which is the ordering that mattered.
+		c.MonitorInterval = time.Hour
+	})
+
+	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	env.tun.setInterface(false)
+
+	// The user's status poll, arriving before any monitor tick could.
+	st, err := env.d.Status(context.Background())
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if st.State == ipc.StateError {
+		t.Fatal("a status poll gave up on the tunnel — this is the bug the live test found")
+	}
+
+	// It must still be repaired, by whoever got there first.
+	waitFor(t, 5*time.Second, "the tunnel to come back", func() bool {
+		return env.d.snapshot().State == ipc.StateConnected
+	})
+	if !env.tun.interfaceUp() {
+		t.Error("the tunnel was never rebuilt")
+	}
+	if !env.ks.armed() {
+		t.Error("the kill switch was not re-armed over the rebuilt tunnel")
 	}
 }
 
