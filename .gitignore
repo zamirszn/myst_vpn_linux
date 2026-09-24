@@ -14,6 +14,13 @@ profile/
 *.pem
 *.key
 
+# reference/ is a deliberate, consented backup of the WireGuard key material
+# (see reference/README.md for the reasoning and the blast radius).
+# Only those two files are un-ignored; the account token stays excluded above.
+!reference/
+!reference/*.conf
+!reference/*.json
+
 # ---- runtime noise ----
 *.log
 node_modules/
