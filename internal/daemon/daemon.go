@@ -435,6 +435,7 @@ func (d *Daemon) bringUp(ctx context.Context, country, ipType string) (*ipc.Stat
 	if d.cfg.IPv6 {
 		conf = wg.EnsureIPv6Route(conf)
 	}
+	conf = wg.EnsureKeepalive(conf)
 	if err := wg.Validate(conf); err != nil {
 		return nil, fmt.Errorf("assembled config is unusable: %w", err)
 	}

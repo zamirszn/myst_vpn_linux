@@ -187,3 +187,35 @@ func Redact(conf string) string {
 	}
 	return strings.Join(out, "\n")
 }
+
+// PersistentKeepaliveLine is appended to the peer when the server's template
+// omits it. Without a keepalive, a client behind NAT stops getting handshakes
+// once the NAT mapping goes idle, and the tunnel is wrongly declared dead by
+// the health monitor's stale-handshake check.
+const PersistentKeepaliveLine = "PersistentKeepalive = 25"
+
+// HasKeepalive reports whether the peer section already sets PersistentKeepalive.
+func HasKeepalive(conf string) bool {
+	return hasField(conf, "PersistentKeepalive")
+}
+
+// EnsureKeepalive appends a PersistentKeepalive setting to the [Peer] section
+// if the server's template did not already include one.
+func EnsureKeepalive(conf string) string {
+	if HasKeepalive(conf) {
+		return conf
+	}
+	lines := strings.Split(conf, "\n")
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "[Peer]" {
+			// Insert right after [Peer] rather than at file end, so it stays
+			// inside the section wg-quick parses it as part of.
+			out := make([]string, 0, len(lines)+1)
+			out = append(out, lines[:i+1]...)
+			out = append(out, PersistentKeepaliveLine)
+			out = append(out, lines[i+1:]...)
+			return strings.Join(out, "\n")
+		}
+	}
+	return conf
+}
