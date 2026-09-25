@@ -287,6 +287,9 @@ func TestMenuOffersConnectWhenDownAndDisconnectWhenUp(t *testing.T) {
 
 func TestMenuChecksTheSelectedRegion(t *testing.T) {
 	c := &fakeClient{statusResp: &status{State: stateDisconnected}}
+	// Lowercase on purpose. The list holds canonical uppercase codes now, and a
+	// user can still hand the applet any casing, so this is the case the
+	// comparison has to get right.
 	a, _ := newTestApp(c, "de")
 	m := &menuMethods{a}
 
@@ -298,7 +301,7 @@ func TestMenuChecksTheSelectedRegion(t *testing.T) {
 			t.Fatalf("region %s has no integer toggle-state", r.Code)
 		}
 		want := int32(0)
-		if r.Code == "de" {
+		if strings.EqualFold(r.Code, "de") {
 			want = 1
 		}
 		if state != want {

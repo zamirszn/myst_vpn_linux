@@ -1,7 +1,11 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
@@ -87,5 +91,57 @@ func TestAPIErrorStillReportsTheRawBody(t *testing.T) {
 	const want = "api 500 2332: Could not retrieve wireguard connect configuration"
 	if got := err.Error(); got != want {
 		t.Errorf("Error() = %q, want %q", got, want)
+	}
+}
+
+// TestConnectNormalisesCountry is the regression for the bug that made every
+// region selection fail while "fastest" worked.
+//
+// The API matches country filters case-sensitively against uppercase ISO
+// codes, and a code that does not match is not ignored — the whole request
+// fails with "no available instance for filters", which reads like the country
+// having no free node. A live probe showed the difference exactly:
+//
+//	country=gb -> HTTP 500 (code 2332)   country=GB -> HTTP 200
+//	country=de -> HTTP 500 (code 2332)   country=DE -> HTTP 200
+//
+// So the fix belongs at the wire boundary, where every caller passes through.
+func TestConnectNormalisesCountry(t *testing.T) {
+	cases := []struct {
+		sent string
+		want string
+	}{
+		{"gb", "GB"},   // what the CLI documents and the old list held
+		{" GB ", "GB"}, // padded
+		{"Gb", "GB"},   // mixed
+		{"GB", "GB"},   // already canonical
+		{"", ""},       // no country: must stay absent, not become something
+	}
+
+	for _, tc := range cases {
+		t.Run("sent "+tc.sent, func(t *testing.T) {
+			var onWire string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body WireguardConnectRequest
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decode request: %v", err)
+				}
+				onWire = body.Country
+				w.Header().Set("Content-Type", "application/json")
+				io.WriteString(w, `{"id":"x","wg_config":"[Interface]","country":"GB"}`)
+			}))
+			defer srv.Close()
+
+			c := New("test-token")
+			c.BaseURL = srv.URL
+			if _, err := c.Connect(context.Background(), WireguardConnectRequest{
+				PublicKey: "pub", Country: tc.sent,
+			}); err != nil {
+				t.Fatalf("Connect: %v", err)
+			}
+			if onWire != tc.want {
+				t.Errorf("country on the wire = %q, want %q", onWire, tc.want)
+			}
+		})
 	}
 }

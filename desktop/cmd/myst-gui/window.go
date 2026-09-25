@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -241,7 +242,10 @@ func regionRow(code string) uint {
 		return 0
 	}
 	for i, r := range regions.All {
-		if r.Code == code {
+		// Case-insensitive for the same reason regions.Name is: the status
+		// carries the API's canonical code, and a mismatch here would silently
+		// drop the picker back to "Fastest" while connected to a country.
+		if strings.EqualFold(r.Code, code) {
 			return uint(i + 1) // +1 for the leading "Fastest" entry
 		}
 	}

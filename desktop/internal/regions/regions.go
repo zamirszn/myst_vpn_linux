@@ -21,27 +21,31 @@ type Region struct {
 // copy of the credential, so the applet offers the countries people actually
 // pick and accepts any code the user sets with -country.
 //
-// Mysterium accepts country codes it has no nodes for; the connect simply fails
-// and the failure lands in the status line.
+// Codes are UPPERCASE because that is the only form the API matches. A
+// lowercase code is not rejected as malformed: it comes back as HTTP 500 with
+// "no available instance for filters", which reads exactly like the country
+// having no free node. Every entry here was lowercase, so every country
+// selection failed while "fastest" worked, and the error pointed at server
+// capacity rather than at this list.
 var All = []Region{
-	{"us", "United States"},
-	{"gb", "United Kingdom"},
-	{"ca", "Canada"},
-	{"de", "Germany"},
-	{"nl", "Netherlands"},
-	{"fr", "France"},
-	{"ch", "Switzerland"},
-	{"se", "Sweden"},
-	{"es", "Spain"},
-	{"it", "Italy"},
-	{"pl", "Poland"},
-	{"ro", "Romania"},
-	{"jp", "Japan"},
-	{"sg", "Singapore"},
-	{"au", "Australia"},
-	{"br", "Brazil"},
-	{"in", "India"},
-	{"za", "South Africa"},
+	{"US", "United States"},
+	{"GB", "United Kingdom"},
+	{"CA", "Canada"},
+	{"DE", "Germany"},
+	{"NL", "Netherlands"},
+	{"FR", "France"},
+	{"CH", "Switzerland"},
+	{"SE", "Sweden"},
+	{"ES", "Spain"},
+	{"IT", "Italy"},
+	{"PL", "Poland"},
+	{"RO", "Romania"},
+	{"JP", "Japan"},
+	{"SG", "Singapore"},
+	{"AU", "Australia"},
+	{"BR", "Brazil"},
+	{"IN", "India"},
+	{"ZA", "South Africa"},
 }
 
 // Name turns a country code into something readable. An unknown code is

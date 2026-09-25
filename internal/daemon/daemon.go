@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -314,7 +315,10 @@ func (d *Daemon) Connect(ctx context.Context, country, ipType string) (*ipc.Stat
 	d.stopMonitor()
 
 	if st := d.snapshot(); st.State == ipc.StateConnected {
-		if country == "" || country == st.Country {
+		// Compared case-insensitively: a caller may pass "gb" while the status
+		// carries the API's canonical "GB". A case mismatch here would tear
+		// down a working tunnel and rebuild it in the region it is already in.
+		if country == "" || strings.EqualFold(country, st.Country) {
 			return d.snapshot(), nil // already there; connecting is idempotent
 		}
 		// A different region was asked for, so the current tunnel has to go.

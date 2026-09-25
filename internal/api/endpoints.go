@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -46,6 +47,17 @@ func (c *Client) Connect(ctx context.Context, req WireguardConnectRequest) (*Wir
 	if req.OS == "" {
 		req.OS = "linux"
 	}
+	// Country filters are matched case-sensitively against uppercase ISO codes.
+	// A code that does not match is not ignored — it fails the entire request
+	// with "no available instance for filters", which reads like the country
+	// having no node rather than like a malformed filter.
+	//
+	// Normalising here means callers can pass whatever the user typed ("gb",
+	// "Gb", " gb ") without having to know that, and only this line has to be
+	// right. The response echoes the canonical code back, so downstream
+	// comparisons see uppercase either way.
+	req.Country = strings.ToUpper(strings.TrimSpace(req.Country))
+
 	var out WireguardConnectResponse
 	if err := c.do(ctx, "POST", "/connection/connect", req, &out); err != nil {
 		return nil, err

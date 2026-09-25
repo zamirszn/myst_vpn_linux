@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"strings"
 
 	"github.com/godbus/dbus/v5"
 )
@@ -156,7 +157,7 @@ func (m *menuMethods) buildLocked() layoutItem {
 		props := enabled(r.Name, !busy)
 		props["toggle-type"] = dbus.MakeVariant("radio")
 		state := int32(0)
-		if r.Code == a.country {
+		if strings.EqualFold(r.Code, a.country) {
 			state = 1
 		}
 		props["toggle-state"] = dbus.MakeVariant(state)
