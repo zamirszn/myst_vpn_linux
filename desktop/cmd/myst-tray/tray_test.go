@@ -26,9 +26,15 @@ type fakeClient struct {
 	disconnectResp *status
 	disconnectErr  error
 
-	statusCalls  int
-	connectCalls int
-	lastCountry  string
+	// countriesResp is what the daemon answers the country list with. Left nil,
+	// the applet keeps the built-in fallback, which is what most tests want.
+	countriesResp []string
+	countriesErr  error
+
+	statusCalls    int
+	connectCalls   int
+	countriesCalls int
+	lastCountry    string
 
 	block chan struct{}
 }
@@ -59,10 +65,23 @@ func (f *fakeClient) Disconnect(context.Context) (*status, error) {
 	return f.disconnectResp, f.disconnectErr
 }
 
+func (f *fakeClient) Countries(context.Context) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.countriesCalls++
+	return f.countriesResp, f.countriesErr
+}
+
 func (f *fakeClient) counts() (statusCalls, connectCalls int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.statusCalls, f.connectCalls
+}
+
+func (f *fakeClient) askedForCountries() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.countriesCalls
 }
 
 // recorder captures emitted signals so tests can assert on them.
@@ -294,8 +313,8 @@ func TestMenuChecksTheSelectedRegion(t *testing.T) {
 	m := &menuMethods{a}
 
 	root := m.buildLocked()
-	for i, r := range regions {
-		props := itemProps(t, root, idRegionBase+int32(i))
+	for _, r := range a.choices {
+		props := itemProps(t, root, a.idForRegion(r.Code))
 		state, ok := props["toggle-state"].Value().(int32)
 		if !ok {
 			t.Fatalf("region %s has no integer toggle-state", r.Code)
@@ -307,6 +326,153 @@ func TestMenuChecksTheSelectedRegion(t *testing.T) {
 		if state != want {
 			t.Errorf("region %s toggle-state = %d, want %d", r.Code, state, want)
 		}
+	}
+}
+
+// TestRegionIDsFollowTheCountryNotTheRow is the regression for a menu id that
+// changes meaning under the user.
+//
+// The list swaps once, from the built-in fallback to the account's real one,
+// and the two are in different orders. If an id named a row, a click that
+// arrived while the panel was re-reading the layout would resolve to whatever
+// country had moved into that row — connecting somewhere nobody chose.
+func TestRegionIDsFollowTheCountryNotTheRow(t *testing.T) {
+	c := &fakeClient{statusResp: &status{State: stateDisconnected}}
+	a, _ := newTestApp(c, "")
+	m := &menuMethods{a}
+	m.buildLocked()
+
+	// The id the menu gave Germany, and the row it sat in, before the daemon
+	// answered.
+	de := a.idForRegion("DE")
+	wasRow := regionRowOf(a.choices, "DE")
+
+	// The real list arrives, sorted by name, with Germany somewhere else
+	// entirely.
+	a.mutate(func() {
+		a.choices = fromCodes([]string{"ZA", "DE", "AR", "PF", "GB"})
+		a.choicesSeq++
+	})
+	m.buildLocked()
+
+	if got := a.idForRegion("DE"); got != de {
+		t.Fatalf("Germany's id changed from %d to %d when the list did", de, got)
+	}
+	if nowRow := regionRowOf(a.choices, "DE"); nowRow == wasRow {
+		t.Fatalf("the test is not exercising anything: Germany is still in row %d", nowRow)
+	}
+
+	// A click on the id the panel last saw still means Germany — and it reaches
+	// the daemon as Germany.
+	if err := m.Event(de, "clicked", dbus.MakeVariant(""), 0); err != nil {
+		t.Fatalf("Event: %v", err)
+	}
+	waitFor(t, "the connect to start", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.lastCountry != ""
+	})
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lastCountry != "DE" {
+		t.Errorf("clicking Germany's old id connected to %q, want DE", c.lastCountry)
+	}
+}
+
+// regionRowOf is the row a country sits in, which is what an id must not be
+// tied to. Returns -1 when it is not on the list.
+func regionRowOf(list []region, code string) int {
+	for i, r := range list {
+		if r.Code == code {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestMenuOffersTheDaemonsCountryList covers the point of the whole change: the
+// account can reach about a hundred countries and the fallback carries
+// eighteen, so a menu built only from the fallback hides most of them.
+func TestMenuOffersTheDaemonsCountryList(t *testing.T) {
+	c := &fakeClient{
+		statusResp:    &status{State: stateDisconnected},
+		countriesResp: []string{"AD", "AE", "PF", "ZA", "GB"},
+	}
+	a, _ := newTestApp(c, "")
+	m := &menuMethods{a}
+
+	a.loadCountries(context.Background())
+	waitFor(t, "the country list to arrive", func() bool {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.haveCountries
+	})
+
+	root := m.buildLocked()
+	// Every country the daemon named is on the menu and resolves back to itself.
+	for _, code := range []string{"AD", "AE", "PF", "ZA", "GB"} {
+		id, ok := a.regionIDs[code]
+		if !ok {
+			t.Fatalf("the daemon offered %s and the menu has no entry for it", code)
+		}
+		props := itemProps(t, root, id)
+		if got := stringProp(t, props, "label"); got != regionName(code) {
+			t.Errorf("%s is labelled %q, want %q", code, got, regionName(code))
+		}
+		if got, _ := a.regionForID(id); got != code {
+			t.Errorf("id %d resolves to %q, want %s", id, got, code)
+		}
+	}
+	// A country only the fallback had is gone: the daemon's answer is the whole
+	// list, not an extension of the built-in one.
+	if _, still := a.regionIDs["US"]; still {
+		t.Error("the fallback's US is still in the menu after the daemon answered")
+	}
+}
+
+// TestCountriesAreAskedForUntilTheyArrive covers the applet started before the
+// daemon. It must keep asking rather than settling on the fallback for the rest
+// of the session — and must not ask more than once at a time.
+func TestCountriesAreAskedForUntilTheyArrive(t *testing.T) {
+	c := &fakeClient{statusResp: &status{State: stateDisconnected}}
+	a, _ := newTestApp(c, "")
+
+	// A daemon that cannot answer yet leaves the fallback up and the applet
+	// still asking.
+	a.loadCountries(context.Background())
+	waitFor(t, "the first attempt to finish", func() bool {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return !a.loadingCountries
+	})
+	a.mu.Lock()
+	got := a.choices
+	a.mu.Unlock()
+	if len(got) != len(fallbackRegions) {
+		t.Errorf("choices changed to %d entries on a failed lookup, want the fallback's %d",
+			len(got), len(fallbackRegions))
+	}
+
+	// It asks again on the next tick.
+	a.loadCountries(context.Background())
+	waitFor(t, "the second attempt", func() bool { return c.askedForCountries() >= 2 })
+
+	// Once it has an answer it stops asking: the list is the account's and does
+	// not change while the applet runs.
+	c.mu.Lock()
+	c.countriesResp = []string{"GB", "DE"}
+	c.mu.Unlock()
+	a.loadCountries(context.Background())
+	waitFor(t, "the list to arrive", func() bool {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.haveCountries
+	})
+	before := c.askedForCountries()
+	a.loadCountries(context.Background())
+	time.Sleep(50 * time.Millisecond)
+	if after := c.askedForCountries(); after != before {
+		t.Errorf("asked for the country list again after it had one (%d → %d)", before, after)
 	}
 }
 

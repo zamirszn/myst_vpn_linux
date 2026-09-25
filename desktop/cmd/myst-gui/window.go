@@ -61,6 +61,21 @@ type window struct {
 
 	// shown is the status currently rendered. Only the main loop touches it.
 	shown daemonclient.Status
+
+	// choices is the country list the picker currently shows, excluding the
+	// leading "Fastest" entry. It starts as the built-in fallback and is
+	// replaced by the real list once the daemon answers.
+	choices []regions.Region
+
+	// haveCountries records whether choices came from the daemon. Until it does,
+	// every poll also asks for the list, so a window opened before mystd was
+	// running fills in as soon as it can.
+	haveCountries atomic.Bool
+
+	// loadingCountries keeps one countries request in flight at a time. Without
+	// it a daemon that accepts connections but never answers would accumulate a
+	// goroutine per poll.
+	loadingCountries atomic.Bool
 }
 
 func newWindow(app *gtk.Application, client daemonclient.Client) *window {
@@ -85,15 +100,14 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	// Entry 0 is "Fastest" and the regions follow it. Without that leading
 	// entry the picker opens on whichever region happens to be first in the
 	// list, so a first-run click on Connect silently asks for that one country
-	// — and fails outright whenever that country has no node free, which is
-	// exactly what happened with the US. Asking for nothing is the safe
-	// default, and it is what the CLI already does.
-	names := make([]string, 0, len(regions.All)+1)
-	names = append(names, fastestLabel)
-	for _, r := range regions.All {
-		names = append(names, r.Name)
-	}
-	w.region = gtk.NewDropDownFromStrings(names)
+	// — and fails outright whenever that country has no node free. Asking for
+	// nothing is the safe default, and it is what the CLI already does.
+	//
+	// The list starts as the built-in fallback so the window opens immediately
+	// rather than waiting on the daemon; the real list, which is the account's
+	// own and about five times longer, replaces it as soon as it arrives.
+	w.choices = regions.All
+	w.region = gtk.NewDropDownFromStrings(w.pickerLabels())
 
 	w.copy = gtk.NewButtonWithLabel("Copy")
 	w.copy.ConnectClicked(func() { w.copyExitIP() })
@@ -175,6 +189,11 @@ func (w *window) onMain(f func()) { glib.IdleAdd(f) }
 
 // poll asks the daemon for its state without blocking the main loop.
 func (w *window) poll() {
+	// The country list is asked for on the same tick until it arrives, so a
+	// window opened before the daemon started is not stuck on the fallback list
+	// for the rest of the session.
+	w.loadCountries()
+
 	if !w.polling.CompareAndSwap(false, true) {
 		return
 	}
@@ -223,25 +242,57 @@ func (w *window) toggle() {
 
 // selectedRegion is the country code currently chosen in the picker, or "" to
 // let the API choose the fastest.
-func (w *window) selectedRegion() string { return regionCodeAt(int(w.region.Selected())) }
+func (w *window) selectedRegion() string { return regionCodeAt(w.choices, int(w.region.Selected())) }
+
+// fillRegions replaces the picker's contents with a country list, keeping the
+// "Fastest" entry at row 0.
+//
+// The list is rebuilt rather than patched because the model is replaced
+// wholesale; the selection is resolved back from the country code it was on, so
+// refreshing underneath the user does not silently move their choice.
+func (w *window) fillRegions(list []regions.Region) {
+	if len(list) == 0 {
+		// Nothing to offer: keep whatever is already there rather than emptying
+		// the picker, which would look like the window had broken.
+		return
+	}
+	was := w.selectedRegion()
+	w.choices = list
+
+	w.region.SetModel(gtk.NewStringList(w.pickerLabels()))
+	w.region.SetSelected(regionRow(list, was))
+}
+
+// pickerLabels is the dropdown's row labels: "Fastest", then the country names.
+func (w *window) pickerLabels() []string {
+	names := make([]string, 0, len(w.choices)+1)
+	names = append(names, fastestLabel)
+	for _, r := range w.choices {
+		names = append(names, r.Name)
+	}
+	return names
+}
 
 // regionCodeAt maps a picker row to a country code, and regionRow does the
 // reverse. They are the only place the "Fastest" offset lives, because an
 // off-by-one here would silently connect the user to the wrong country.
-func regionCodeAt(row int) string {
+//
+// They take the list rather than reading a global so they stay pure, and
+// therefore testable without a display.
+func regionCodeAt(list []regions.Region, row int) string {
 	// Row 0 is "Fastest" and a fresh dropdown reports -1, so both mean the same
 	// thing: ask for no country in particular.
-	if row <= 0 || row > len(regions.All) {
+	if row <= 0 || row > len(list) {
 		return ""
 	}
-	return regions.All[row-1].Code
+	return list[row-1].Code
 }
 
-func regionRow(code string) uint {
+func regionRow(list []regions.Region, code string) uint {
 	if code == "" {
 		return 0
 	}
-	for i, r := range regions.All {
+	for i, r := range list {
 		// Case-insensitive for the same reason regions.Name is: the status
 		// carries the API's canonical code, and a mismatch here would silently
 		// drop the picker back to "Fastest" while connected to a country.
@@ -356,7 +407,41 @@ func (w *window) apply(st daemonclient.Status) {
 
 // selectRegion moves the picker to a country code, so the window shows the
 // region actually in use rather than the one that happened to be highlighted.
-func (w *window) selectRegion(code string) { w.region.SetSelected(regionRow(code)) }
+func (w *window) selectRegion(code string) { w.region.SetSelected(regionRow(w.choices, code)) }
+
+// loadCountries pulls the account's country list from the daemon.
+//
+// It runs off the main loop like every other daemon call, and is harmless to
+// repeat: it is only asked for until it succeeds. The built-in fallback stays
+// on screen until then, so a window opened before the daemon is up still works.
+func (w *window) loadCountries() {
+	if w.haveCountries.Load() {
+		return
+	}
+	if !w.loadingCountries.CompareAndSwap(false, true) {
+		return // one attempt in flight is enough
+	}
+	go func() {
+		defer w.loadingCountries.Store(false)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		codes, err := w.client.Countries(ctx)
+		if err != nil || len(codes) == 0 {
+			// Not worth showing the user: they already see the fallback list,
+			// and the status poll reports a daemon that is not answering.
+			return
+		}
+		list := regions.FromCodes(codes)
+		w.onMain(func() {
+			if w.haveCountries.Swap(true) {
+				return // a slower earlier request beat us to it
+			}
+			w.fillRegions(list)
+		})
+	}()
+}
 
 // showUnreachable is for a daemon that did not answer at all, which is a
 // different problem from a daemon that answered with a failure.

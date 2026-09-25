@@ -44,6 +44,11 @@ type Tunnel interface {
 type Provisioner interface {
 	Connect(ctx context.Context, req api.WireguardConnectRequest) (*api.WireguardConnectResponse, error)
 	Disconnect(ctx context.Context) error
+
+	// Config reports the countries the account can reach. It is part of this
+	// interface rather than a separate dependency because it is the same
+	// authenticated client, built from the same token.
+	Config(ctx context.Context) (*api.ConnectionConfig, error)
 }
 
 // APIFor builds a Provisioner for an access token. A function rather than a
@@ -358,6 +363,28 @@ func (d *Daemon) Connect(ctx context.Context, country, ipType string) (*ipc.Stat
 		"wake_lock", st.WakeLock,
 	)
 	return d.snapshot(), nil
+}
+
+// Countries lists the country codes the account can connect to.
+//
+// The full list lives behind an authenticated endpoint, so it can only be
+// fetched with the token — which is the daemon's. Serving it over the control
+// socket is what lets the window and the tray offer every country without
+// holding a credential of their own.
+//
+// It deliberately does not take opMu: reading a list has nothing to do with
+// the tunnel, and blocking it behind a two-minute connect would leave the
+// region picker empty for as long as the user is waiting to connect.
+func (d *Daemon) Countries(ctx context.Context) ([]string, error) {
+	tok, err := d.tokens.EnsureValid(ctx, d.store, d.cfg.RefreshMargin)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := d.apiFor(tok.AccessToken).Config(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list countries: %w", err)
+	}
+	return cfg.Countries, nil
 }
 
 // bringUp performs the full connect sequence. Caller holds opMu.

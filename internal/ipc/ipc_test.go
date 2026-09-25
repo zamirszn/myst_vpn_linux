@@ -16,6 +16,9 @@ type stubHandler struct {
 	connected   bool
 	connectErr  error
 	lastCountry string
+
+	countries    []string
+	countriesErr error
 }
 
 func (h *stubHandler) Connect(_ context.Context, country, _ string) (*Status, error) {
@@ -37,6 +40,13 @@ func (h *stubHandler) Status(context.Context) (*Status, error) {
 		return &Status{State: StateConnected}, nil
 	}
 	return &Status{State: StateDisconnected}, nil
+}
+
+func (h *stubHandler) Countries(context.Context) ([]string, error) {
+	if h.countriesErr != nil {
+		return nil, h.countriesErr
+	}
+	return h.countries, nil
 }
 
 // serve starts a server on a temporary socket and returns a client for it.
@@ -221,5 +231,64 @@ func TestDesktopFrontEndsKnowEveryState(t *testing.T) {
 		if !strings.Contains(string(raw), `"`+string(st)+`"`) {
 			t.Errorf("daemonclient does not know the %q state — every desktop front end would render it as disconnected", st)
 		}
+	}
+}
+
+func TestCountriesRoundTrip(t *testing.T) {
+	c := serve(t, &stubHandler{countries: []string{"GB", "US", "DE"}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	got, err := c.Countries(ctx)
+	if err != nil {
+		t.Fatalf("Countries: %v", err)
+	}
+	want := []string{"GB", "US", "DE"}
+	if len(got) != len(want) {
+		t.Fatalf("Countries() returned %d codes, want %d: %v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Countries()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestCountriesErrorSurfaces makes sure a daemon that cannot reach the API
+// reports that, rather than answering with an empty list a caller would render
+// as "this account has no countries".
+func TestCountriesErrorSurfaces(t *testing.T) {
+	c := serve(t, &stubHandler{countriesErr: errors.New("list countries: api 401: token expired")})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := c.Countries(ctx)
+	if err == nil {
+		t.Fatal("expected the handler's error to surface")
+	}
+	if got := err.Error(); got != "list countries: api 401: token expired" {
+		t.Errorf("error = %q, want the handler's message verbatim", got)
+	}
+}
+
+// TestStatusIsUnaffectedByTheNewField guards the shared response shape: adding
+// Countries to Response must not disturb the commands that only want a status.
+func TestStatusIsUnaffectedByTheNewField(t *testing.T) {
+	c := serve(t, &stubHandler{countries: []string{"GB"}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	st, err := c.Status(ctx)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if st == nil {
+		t.Fatal("Status returned nothing")
+	}
+	if st.State != StateDisconnected {
+		t.Errorf("State = %q, want %q", st.State, StateDisconnected)
 	}
 }

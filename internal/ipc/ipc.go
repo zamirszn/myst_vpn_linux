@@ -35,6 +35,7 @@ const (
 	CmdDisconnect = "disconnect"
 	CmdStatus     = "status"
 	CmdPing       = "ping"
+	CmdCountries  = "countries"
 )
 
 // Request is a control message from a client.
@@ -96,6 +97,11 @@ type Response struct {
 	OK     bool    `json:"ok"`
 	Error  string  `json:"error,omitempty"`
 	Status *Status `json:"status,omitempty"`
+
+	// Countries carries the answer to CmdCountries. It rides alongside Status
+	// rather than in a response type of its own so that a single response shape
+	// stays valid for every command.
+	Countries []string `json:"countries,omitempty"`
 }
 
 // Handler is what the daemon must implement to serve IPC.
@@ -103,6 +109,15 @@ type Handler interface {
 	Connect(ctx context.Context, country, ipType string) (*Status, error)
 	Disconnect(ctx context.Context) (*Status, error)
 	Status(ctx context.Context) (*Status, error)
+
+	// Countries lists the country codes the account can connect to.
+	//
+	// It is served from here rather than fetched by each front end because the
+	// list lives behind an authenticated endpoint and the token belongs to the
+	// daemon. A desktop applet running as the logged-in user would otherwise
+	// need its own copy of the credential, which is the split this project
+	// exists to avoid.
+	Countries(ctx context.Context) ([]string, error)
 }
 
 // Server listens on a unix socket and dispatches to a Handler.
@@ -244,8 +259,9 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	defer cancel()
 
 	var (
-		status *Status
-		herr   error
+		status    *Status
+		countries []string
+		herr      error
 	)
 	switch req.Command {
 	case CmdConnect:
@@ -254,6 +270,8 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		status, herr = s.Handler.Disconnect(callCtx)
 	case CmdStatus, CmdPing:
 		status, herr = s.Handler.Status(callCtx)
+	case CmdCountries:
+		countries, herr = s.Handler.Countries(callCtx)
 	default:
 		herr = fmt.Errorf("unknown command %q", req.Command)
 	}
@@ -264,7 +282,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		encode(conn, Response{Error: herr.Error(), Status: status})
 		return
 	}
-	encode(conn, Response{OK: true, Status: status})
+	encode(conn, Response{OK: true, Status: status, Countries: countries})
 }
 
 func decodeRequest(r io.Reader) (Request, error) {

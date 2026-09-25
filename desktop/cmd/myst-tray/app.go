@@ -35,6 +35,7 @@ type daemonClient interface {
 	Status(ctx context.Context) (*status, error)
 	Connect(ctx context.Context, country, ipType string) (*status, error)
 	Disconnect(ctx context.Context) (*status, error)
+	Countries(ctx context.Context) ([]string, error)
 }
 
 // app is the shared state behind both D-Bus objects. Every mutation goes
@@ -61,6 +62,28 @@ type app struct {
 	// country is the region the user picked, remembered across connects.
 	country string
 
+	// choices is the country list the Region submenu offers — the account's own
+	// list once the daemon has answered, and the built-in fallback until then.
+	//
+	// regionIDs and regionCodes are the two directions of the mapping between a
+	// country and its menu id. See idForRegion for why the id belongs to the
+	// country rather than to its row.
+	choices      []region
+	regionIDs    map[string]int32
+	regionCodes  map[int32]string
+	nextRegionID int32
+
+	// choicesSeq changes whenever choices does. It is folded into the menu key
+	// because the revision is what tells the panel to re-read the menu, and a
+	// swapped country list does not show up in any of the state fields.
+	choicesSeq int
+
+	// haveCountries records that choices came from the daemon. Until it does,
+	// every poll asks again, so an applet started before the daemon fills in as
+	// soon as it can. loadingCountries keeps one request in flight at a time.
+	haveCountries    bool
+	loadingCountries bool
+
 	// busy is true while a connect or disconnect is in flight. The daemon
 	// serialises commands behind one mutex, so polling status during a connect
 	// would block for as long as the connect takes.
@@ -84,6 +107,14 @@ func newApp(conn *dbus.Conn, c daemonClient, country string) *app {
 		client:  c,
 		country: country,
 		quit:    make(chan struct{}),
+
+		// The fallback list, so the menu has regions in it before the daemon has
+		// been heard from. The account's real list replaces it on the first
+		// answer, and is about five times longer.
+		choices:      fallbackRegions,
+		regionIDs:    map[string]int32{},
+		regionCodes:  map[int32]string{},
+		nextRegionID: idRegionBase,
 	}
 	if conn != nil {
 		a.emitTo = conn.Emit
@@ -136,10 +167,11 @@ func (a *app) syncLocked() {
 	}
 
 	// The menu can change for reasons the state string does not capture — a new
-	// exit IP, a different selected region. Hashing what the menu actually
-	// shows keeps the revision honest without every caller remembering to bump
-	// it.
-	menuKey := fmt.Sprintf("%t|%s|%s|%s|%s", a.reachable, a.st.State, a.st.Country, a.st.ExitIP, a.country)
+	// exit IP, a different selected region, a country list that arrived from the
+	// daemon. Hashing what the menu actually shows keeps the revision honest
+	// without every caller remembering to bump it.
+	menuKey := fmt.Sprintf("%t|%s|%s|%s|%s|%d",
+		a.reachable, a.st.State, a.st.Country, a.st.ExitIP, a.country, a.choicesSeq)
 	if menuKey != a.menuFor {
 		a.menuFor = menuKey
 		a.rev++
@@ -226,6 +258,52 @@ func (a *app) emit(path dbus.ObjectPath, name string, args ...any) {
 	if err := a.emitTo(path, name, args...); err != nil {
 		log.Printf("emit %s: %v", name, err)
 	}
+}
+
+// loadCountries asks the daemon what countries the account can reach and puts
+// them in the menu.
+//
+// The list is asked of the daemon rather than built in, because it is the
+// account's own and it is long — about a hundred countries, against the
+// eighteen worth offering when there is nobody to ask. Asking the API directly
+// is not an option for a front end: it needs the access token, and the token
+// belongs to the daemon.
+//
+// It runs off the caller's goroutine because it is a socket call, and it is
+// asked for only until it succeeds — the fallback stays on screen until then,
+// so an applet started before the daemon is still usable.
+func (a *app) loadCountries(ctx context.Context) {
+	a.mu.Lock()
+	if a.haveCountries || a.loadingCountries {
+		a.mu.Unlock()
+		return
+	}
+	a.loadingCountries = true
+	a.mu.Unlock()
+
+	go func() {
+		cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+
+		codes, err := a.client.Countries(cctx)
+
+		a.mutate(func() {
+			a.loadingCountries = false
+			if err != nil || len(codes) == 0 {
+				// Not worth telling the user about: they already have the fallback
+				// list, and a daemon that is not answering already says so at the
+				// top of the menu and in the icon.
+				return
+			}
+			list := fromCodes(codes)
+			if len(list) == 0 {
+				return
+			}
+			a.haveCountries = true
+			a.choices = list
+			a.choicesSeq++
+		})
+	}()
 }
 
 // refresh asks the daemon for its state and folds the answer in.

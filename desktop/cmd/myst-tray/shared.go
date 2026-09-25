@@ -33,7 +33,13 @@ const (
 )
 
 var (
-	regions    = regionlist.All
+	// fallbackRegions is the built-in list, shown only until the daemon supplies
+	// the account's real one. It is named for what it is rather than "regions":
+	// the applet's live list is app.choices, and a package-level `regions` that
+	// silently stopped being the list on screen would be a trap.
+	fallbackRegions = regionlist.All
+
+	fromCodes  = regionlist.FromCodes
 	regionName = regionlist.Name
 	titleCase  = regionlist.TitleCase
 )

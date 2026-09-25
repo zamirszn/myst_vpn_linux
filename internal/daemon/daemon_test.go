@@ -156,8 +156,19 @@ type fakeAPI struct {
 	mu          sync.Mutex
 	connectResp *api.WireguardConnectResponse
 	connectErr  error
+	configResp  *api.ConnectionConfig
+	configErr   error
 	disconnects int
 	lastReq     api.WireguardConnectRequest
+}
+
+func (f *fakeAPI) Config(context.Context) (*api.ConnectionConfig, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.configErr != nil {
+		return nil, f.configErr
+	}
+	return f.configResp, nil
 }
 
 func (f *fakeAPI) Connect(_ context.Context, req api.WireguardConnectRequest) (*api.WireguardConnectResponse, error) {

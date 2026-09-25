@@ -98,7 +98,9 @@ func run() error {
 	defer stop()
 
 	// Poll once before entering the loop, so the icon shows the real state
-	// rather than a placeholder for the first interval.
+	// rather than a placeholder for the first interval. The country list is
+	// asked for alongside it, and asked again on each tick until it arrives.
+	a.loadCountries(ctx)
 	a.refresh(ctx)
 
 	ticker := time.NewTicker(pollInterval)
@@ -111,6 +113,7 @@ func run() error {
 		case <-a.quit:
 			return nil
 		case <-ticker.C:
+			a.loadCountries(ctx)
 			a.refresh(ctx)
 		}
 	}

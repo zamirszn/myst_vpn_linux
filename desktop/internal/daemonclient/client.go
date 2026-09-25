@@ -49,6 +49,10 @@ type response struct {
 	OK     bool    `json:"ok"`
 	Error  string  `json:"error,omitempty"`
 	Status *Status `json:"status,omitempty"`
+
+	// Countries answers the "countries" command. It rides alongside Status so
+	// one response shape stays valid for every command.
+	Countries []string `json:"countries,omitempty"`
 }
 
 // Status mirrors ipc.Status, restricted to what a front end displays.
@@ -79,6 +83,16 @@ func (c Client) socketPath() string {
 
 // Call sends one request and returns the resulting status.
 func (c Client) Call(ctx context.Context, req request) (*Status, error) {
+	resp, err := c.call(ctx, req)
+	if resp == nil {
+		return nil, err
+	}
+	return resp.Status, err
+}
+
+// call sends one request and returns the whole response, for commands whose
+// answer is not a status.
+func (c Client) call(ctx context.Context, req request) (*response, error) {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "unix", c.socketPath())
 	if err != nil {
@@ -103,9 +117,9 @@ func (c Client) Call(ctx context.Context, req request) (*Status, error) {
 		if msg == "" {
 			msg = "the daemon reported a failure with no detail"
 		}
-		return resp.Status, errors.New(msg)
+		return &resp, errors.New(msg)
 	}
-	return resp.Status, nil
+	return &resp, nil
 }
 
 // Status reports the daemon's current state.
@@ -121,4 +135,18 @@ func (c Client) Connect(ctx context.Context, country, ipType string) (*Status, e
 // Disconnect tears the tunnel down.
 func (c Client) Disconnect(ctx context.Context) (*Status, error) {
 	return c.Call(ctx, request{Command: "disconnect"})
+}
+
+// Countries lists the country codes the account can connect to, in the
+// canonical uppercase form the API uses.
+//
+// Asked of the daemon rather than of the API directly: the list needs the
+// access token, and the token belongs to the daemon. This is what lets a front
+// end offer every country without holding a credential of its own.
+func (c Client) Countries(ctx context.Context) ([]string, error) {
+	resp, err := c.call(ctx, request{Command: "countries"})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Countries, nil
 }

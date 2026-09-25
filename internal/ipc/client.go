@@ -21,6 +21,16 @@ func (c Client) socketPath() string {
 
 // Call sends one request and returns the resulting status.
 func (c Client) Call(ctx context.Context, req Request) (*Status, error) {
+	resp, err := c.call(ctx, req)
+	if resp == nil {
+		return nil, err
+	}
+	return resp.Status, err
+}
+
+// call sends one request and returns the whole response, for commands whose
+// answer is not a status.
+func (c Client) call(ctx context.Context, req Request) (*Response, error) {
 	path := c.socketPath()
 
 	var d net.Dialer
@@ -47,11 +57,11 @@ func (c Client) Call(ctx context.Context, req Request) (*Status, error) {
 		if msg == "" {
 			msg = "daemon reported failure with no detail"
 		}
-		// Return the status too: on failure the daemon still reports what it
+		// Return the response too: on failure the daemon still reports what it
 		// knows, which is usually more useful than the error alone.
-		return resp.Status, errors.New(msg)
+		return &resp, errors.New(msg)
 	}
-	return resp.Status, nil
+	return &resp, nil
 }
 
 // Connect brings the tunnel up.
@@ -73,4 +83,19 @@ func (c Client) Status(ctx context.Context) (*Status, error) {
 func (c Client) Ping(ctx context.Context) error {
 	_, err := c.Call(ctx, Request{Command: CmdPing})
 	return err
+}
+
+// Countries lists the country codes the daemon's account can connect to, in the
+// canonical uppercase form the API uses.
+//
+// The list comes from the daemon rather than from the API directly because
+// fetching it needs the access token, and the token deliberately belongs to the
+// daemon. This is how a front end offers every country without holding a
+// credential.
+func (c Client) Countries(ctx context.Context) ([]string, error) {
+	resp, err := c.call(ctx, Request{Command: CmdCountries})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Countries, nil
 }

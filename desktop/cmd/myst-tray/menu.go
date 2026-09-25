@@ -7,8 +7,9 @@ import (
 	"github.com/godbus/dbus/v5"
 )
 
-// Menu item ids. Region entries get a contiguous block so an id maps back to a
-// country by subtraction rather than a lookup table that could drift.
+// Menu item ids. Region entries are allocated out of their own block by
+// idForRegion, which is what keeps an id attached to one country for the life
+// of the process.
 const (
 	idStatus     = 1
 	idSepTop     = 2
@@ -22,6 +23,39 @@ const (
 	idSepEnd = 21
 	idQuit   = 22
 )
+
+// idForRegion returns the menu id for a country, allocating one the first time
+// it is seen. Caller holds a.mu.
+//
+// The id belongs to the country, not to its row, and that is the whole point.
+// The list changes once in the applet's life — from the built-in fallback to
+// the account's real one — and the two are in different orders: the fallback is
+// hand-ordered by popularity, the real list is sorted by display name. A
+// row-indexed id would name a different country after that swap, so a click
+// that raced the panel's re-read would connect somewhere the user did not
+// choose. An id handed to exactly one country cannot do that.
+//
+// Ids are never reused, so the mapping only grows. That costs a handful of ints
+// for a list that changes at most twice.
+func (a *app) idForRegion(code string) int32 {
+	code = strings.ToUpper(strings.TrimSpace(code))
+	if id, ok := a.regionIDs[code]; ok {
+		return id
+	}
+	id := a.nextRegionID
+	a.nextRegionID++
+	a.regionIDs[code] = id
+	a.regionCodes[id] = code
+	return id
+}
+
+// regionForID is the reverse, used when a click comes in. The bool reports
+// whether the id names a country at all, so a stale click from a panel that has
+// not caught up is ignored rather than guessed at.
+func (a *app) regionForID(id int32) (string, bool) {
+	code, ok := a.regionCodes[id]
+	return code, ok
+}
 
 // layoutItem is dbusmenu's (ia{sv}av): an id, its properties, and its children
 // as variants so the recursion can nest.
@@ -115,8 +149,13 @@ func (m *menuMethods) Event(id int32, eventID string, data dbus.Variant, timesta
 		}
 	case id == idQuit:
 		a.quitNow()
-	case id >= idRegionBase && id < idRegionBase+int32(len(regions)):
-		a.doConnect(regions[id-idRegionBase].Code)
+	default:
+		// Regions are found by looking the id up rather than by subtracting a
+		// base, because a click can arrive for a country the menu no longer
+		// lists — the panel may not have re-read the layout yet.
+		if code, ok := a.regionForID(id); ok {
+			a.doConnect(code)
+		}
 	}
 	return nil
 }
@@ -151,9 +190,11 @@ func (m *menuMethods) buildLocked() layoutItem {
 	add(layoutItem{ID: idConnect, Properties: enabled("Connect", !busy && !connected)})
 	add(layoutItem{ID: idDisconnect, Properties: enabled("Disconnect", !busy && connected)})
 
-	// Region submenu, with the current one checked.
+	// Region submenu, with the current one checked. The list is whatever the
+	// daemon last supplied, which is the account's own — the built-in fallback
+	// only until that first answer arrives.
 	sub := layoutItem{ID: idRegion, Properties: submenuProps("Region"), Children: []dbus.Variant{}}
-	for i, r := range regions {
+	for _, r := range a.choices {
 		props := enabled(r.Name, !busy)
 		props["toggle-type"] = dbus.MakeVariant("radio")
 		state := int32(0)
@@ -162,7 +203,7 @@ func (m *menuMethods) buildLocked() layoutItem {
 		}
 		props["toggle-state"] = dbus.MakeVariant(state)
 		sub.Children = append(sub.Children, dbus.MakeVariant(layoutItem{
-			ID:         idRegionBase + int32(i),
+			ID:         a.idForRegion(r.Code),
 			Properties: props,
 		}))
 	}

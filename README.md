@@ -227,23 +227,38 @@ been watched through a real drop on a live tunnel.
 but routes no IPv6, so on a host with IPv6 connectivity that traffic bypasses the
 tunnel. This client appends `::/0` to close it; `-no-ipv6` turns that off.
 
-**A region can be temporarily unserved.** Ask for a country with no free node
-and the API answers with an HTTP 500 — which reads like a server fault but is
-not one. The country simply has nothing available at that moment, and the fix is
-to pick another. The client says exactly that instead of passing the 500
-through, because "api 500 2332: Could not retrieve wireguard connect
-configuration" tells you nothing you can act on.
+**"No available instance for filters" does not always mean what it says.** The
+API answers a connect it cannot satisfy with HTTP 500 / code 2332, and the text
+reads like the country having no free node. It is also what you get for a filter
+that matches nothing at all — including a country code in the wrong case, which
+is the bug that made every region selection fail while "Fastest" kept working.
+The case bug is fixed, and the client now reports this error as "no servers are
+available in <country> at the moment" rather than passing the 500 through. But
+the message remains ambiguous, so treat it as "this request could not be
+satisfied" rather than as a statement about capacity.
 
-This is why the window's picker defaults to **Fastest** and the CLI takes no
-country unless you name one: asking for nothing lets the API choose a node that
-is actually free, rather than one you did not mean to choose.
+A country that genuinely has no node at that moment is still possible. It has
+not been observed directly — every 2332 seen so far turned out to be the case
+bug — so the wording is a best reading of the API, not a verified one.
 
-**The tray's region list is curated, not fetched.** The full country list lives
-behind an authenticated endpoint, and the token belongs to the daemon — copying
-it into an unprivileged desktop applet would undo the point of the split. The
-applet offers the countries people actually pick and accepts any code passed to
-`-country`, so `myst connect --country xx` reaches regions the menu does not
-list.
+This is why the picker defaults to **Fastest** and the CLI takes no country
+unless you name one: asking for nothing lets the API choose a node that is
+actually free, rather than one you did not mean to choose.
+
+**The country list comes from the account, by way of the daemon.** The full list
+lives behind an authenticated endpoint — about a hundred countries against the
+eighteen worth hard-coding — and the token belongs to the daemon, so the daemon
+serves the list over the control socket. No front end holds a credential, and
+all three offer the same countries.
+
+Both the tray and the window start on a short built-in fallback and swap in the
+real list as soon as the daemon answers, so either is usable against a daemon
+that is not running yet. The fallback is a fallback: it is smaller than the real
+list, not a different one.
+
+The full list is not a promise either. The API advertises more countries than it
+will necessarily have free at any moment, and a code it does not serve fails at
+connect time.
 
 **Not yet settled:** whether two WireGuard connections can handshake
 simultaneously on one account, a terms-of-service review for third-party clients,
