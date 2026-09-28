@@ -102,11 +102,33 @@ const (
 	DefaultMonitorInterval = 10 * time.Second
 
 	// DefaultStaleAfter is how old the last handshake may be before the tunnel
-	// is presumed dead. The config sets PersistentKeepalive = 25, so this is
-	// three and a half keepalive intervals: long enough that a busy or briefly
-	// idle machine does not produce false positives, short enough that a real
-	// drop is caught in well under two minutes.
-	DefaultStaleAfter = 90 * time.Second
+	// is presumed dead.
+	//
+	// This is WireGuard's own REJECT_AFTER_TIME (180s) — the age at which the
+	// protocol itself declares a session unusable and refuses to pass traffic
+	// through it. Past that point there is no ambiguity left to resolve: the
+	// tunnel is not slow, it is dead.
+	//
+	// It must be at least that large, and the reason is a trap worth spelling
+	// out. A handshake is NOT refreshed by traffic. PersistentKeepalive = 25
+	// sends a packet every 25s, but on an established session those keepalives
+	// travel inside the existing session and leave its handshake timestamp
+	// alone. What refreshes it is the rekey, which WireGuard initiates only once
+	// the session reaches REKEY_AFTER_TIME (120s) — and then not until the next
+	// packet is sent, so up to 25s later.
+	//
+	// So a perfectly healthy idle tunnel has a handshake age that climbs to
+	// ~145s and then drops back to zero. Any threshold below that sawtooth tears
+	// down a working tunnel on a timer: this was 90s, justified at the time as
+	// "three and a half keepalive intervals", which reasoned about the wrong
+	// timer entirely. The user-visible result was a client that disconnected
+	// itself every couple of minutes reporting "no handshake for 1m43sec".
+	//
+	// The cost of being conservative is detection latency on the one signal this
+	// is a backstop for; the cost of being eager is hanging up on a working
+	// tunnel. The fast signals — a changed default route, a vanished interface —
+	// catch the common failures within one interval regardless.
+	DefaultStaleAfter = 180 * time.Second
 
 	// DefaultMaxRecoveryAttempts and DefaultRecoveryWindow bound the reconnect
 	// loop. Both are limits on the same thing from different angles — attempts

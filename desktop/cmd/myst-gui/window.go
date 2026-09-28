@@ -29,6 +29,14 @@ const opTimeout = 3 * time.Minute
 // which asks the API to choose the best node.
 const fastestLabel = "Fastest (recommended)"
 
+// fallbackNote is shown while the picker is on the built-in list rather than
+// the account's own. It names the likely cause, because the likely cause is a
+// daemon older than this window, and that is not something the window can fix
+// by trying harder.
+const fallbackNote = `<span foreground="#888" size="small">Common regions only — ` +
+	`the daemon could not list them all. If mystd is up to date, either the ` +
+	`list is still loading or the daemon is not answering.</span>`
+
 type window struct {
 	app    *gtk.Application
 	client daemonclient.Client
@@ -38,6 +46,7 @@ type window struct {
 	detail  *gtk.Label
 	action  *gtk.Button
 	region  *gtk.DropDown
+	note    *gtk.Label
 	exitIP  *gtk.Label
 	copy    *gtk.Button
 	iface   *gtk.Label
@@ -109,6 +118,16 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	w.choices = regions.All
 	w.region = gtk.NewDropDownFromStrings(w.pickerLabels())
 
+	// Says so when the picker is on the built-in fallback rather than the
+	// account's real list. Without it the two are indistinguishable, and a
+	// daemon too old to answer "countries" — which is exactly what an
+	// un-upgraded mystd is — looks like a client that only knows eighteen
+	// countries.
+	w.note = gtk.NewLabel("")
+	w.note.SetWrap(true)
+	w.note.SetHAlign(gtk.AlignStart)
+	w.note.SetMarkup(fallbackNote)
+
 	w.copy = gtk.NewButtonWithLabel("Copy")
 	w.copy.ConnectClicked(func() { w.copyExitIP() })
 
@@ -122,6 +141,7 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	body.Append(w.detail)
 	body.Append(w.action)
 	body.Append(w.region)
+	body.Append(w.note)
 	body.Append(gtk.NewSeparator(gtk.OrientationHorizontal))
 	body.Append(w.details())
 
@@ -261,6 +281,10 @@ func (w *window) fillRegions(list []regions.Region) {
 
 	w.region.SetModel(gtk.NewStringList(w.pickerLabels()))
 	w.region.SetSelected(regionRow(list, was))
+
+	// The real list is on screen, so the disclaimer about not having it is no
+	// longer true.
+	w.note.SetVisible(false)
 }
 
 // pickerLabels is the dropdown's row labels: "Fastest", then the country names.

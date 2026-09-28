@@ -836,6 +836,80 @@ func TestMonitorReconnectsAfterTheHandshakeGoesStale(t *testing.T) {
 	}
 }
 
+// TestMonitorLeavesAHealthyIdleTunnelAlone is the regression for a monitor that
+// hung up on a working tunnel every couple of minutes.
+//
+// The bug was the stale threshold being shorter than WireGuard's own rekey
+// cycle. A handshake is not refreshed by traffic: PersistentKeepalive sends a
+// packet every 25s, but on an established session those travel inside it and
+// leave the handshake timestamp untouched. Only the rekey refreshes it, and
+// WireGuard starts that at REKEY_AFTER_TIME (120s), on the first send after —
+// so up to one keepalive later.
+//
+// The result was a handshake age that legitimately reached ~145s on a tunnel
+// that was working perfectly, and a 90s threshold that declared it dead. The
+// user saw the client disconnect itself reporting "no handshake for 1m43sec".
+//
+// This drives the monitor with exactly that age and asserts it does nothing.
+func TestMonitorLeavesAHealthyIdleTunnelAlone(t *testing.T) {
+	env := newTestDaemon(t, func(c *Config, _ *testEnv, _ *Deps) { monitorOn(c) })
+
+	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// The age a healthy idle tunnel reaches just before its rekey: the rekey
+	// interval plus one keepalive. Route and interface are untouched, so the
+	// handshake check is the only signal that could fire.
+	healthyIdleAge := 120*time.Second + 25*time.Second
+	env.tun.setHandshake(time.Now().Add(-healthyIdleAge))
+
+	// Several monitor intervals: a threshold below this age would rebuild on the
+	// first one.
+	time.Sleep(100 * time.Millisecond)
+
+	if up, _ := env.tun.calls(); up != 1 {
+		t.Errorf("Up called %d times, want 1 — the monitor rebuilt a healthy tunnel whose handshake was only %s old",
+			up, healthyIdleAge)
+	}
+	if st := env.d.snapshot(); st.State != ipc.StateConnected {
+		t.Errorf("state = %s, want connected — a healthy idle tunnel was torn down", st.State)
+	}
+}
+
+// TestStaleThresholdOutlastsTheRekeyCycle pins the default against WireGuard's
+// timers rather than against a comment.
+//
+// The threshold is only ever tested with an explicit value — every monitor test
+// sets StaleAfter itself — so the default could be, and was, wrong in a way
+// nothing caught. These are the protocol's constants, written out because the
+// daemon cannot import them from anywhere.
+func TestStaleThresholdOutlastsTheRekeyCycle(t *testing.T) {
+	const (
+		// wg's REKEY_AFTER_TIME: the session age at which a new handshake starts.
+		rekeyAfterTime = 120 * time.Second
+		// The config's PersistentKeepalive, which bounds the delay before that
+		// rekey is triggered by a send.
+		persistentKeepalive = 25 * time.Second
+		// wg's REJECT_AFTER_TIME: past this the session cannot carry traffic.
+		rejectAfterTime = 180 * time.Second
+	)
+
+	// A healthy idle tunnel's handshake age peaks here, and anything at or below
+	// it tears down working tunnels on a timer.
+	if healthyPeak := rekeyAfterTime + persistentKeepalive; DefaultStaleAfter <= healthyPeak {
+		t.Errorf("DefaultStaleAfter = %s, which a healthy idle tunnel's handshake age (%s) reaches — the monitor would disconnect a working tunnel",
+			DefaultStaleAfter, healthyPeak)
+	}
+
+	// And it should not be so eager that it fires while the session is still
+	// theoretically usable, or the backstop reports drops that are not drops.
+	if DefaultStaleAfter < rejectAfterTime {
+		t.Errorf("DefaultStaleAfter = %s, below WireGuard's REJECT_AFTER_TIME (%s) — a session that old may still recover on its own",
+			DefaultStaleAfter, rejectAfterTime)
+	}
+}
+
 func TestMonitorReturnsTheNetworkWhenRecoveryKeepsFailing(t *testing.T) {
 	env := newTestDaemon(t, func(c *Config, _ *testEnv, _ *Deps) { monitorOn(c) })
 

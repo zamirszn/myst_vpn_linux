@@ -27,6 +27,7 @@ commands:
   connect      bring the tunnel up
   disconnect   tear the tunnel down
   status       report the current state
+  countries    list the countries this account can connect to
   login        import credentials from a captured token
   logout       delete stored credentials
   version      print the version
@@ -51,6 +52,8 @@ func main() {
 		err = cmdDisconnect(args)
 	case "status":
 		err = cmdStatus(args)
+	case "countries":
+		err = cmdCountries(args)
 	case "login":
 		err = cmdLogin(args)
 	case "logout":
@@ -120,6 +123,36 @@ func cmdStatus(args []string) error {
 		return enc.Encode(st)
 	}
 	printStatus(st)
+	return nil
+}
+
+// cmdCountries prints the countries the account can connect to, one code per
+// line so the output pipes.
+//
+// The list comes from the daemon, not from here: it needs the access token, and
+// the token belongs to the daemon. It is also the account's own list, which is
+// about a hundred countries — far more than the desktop front ends carry as a
+// fallback for when the daemon cannot be reached.
+func cmdCountries(args []string) error {
+	fs := flag.NewFlagSet("countries", flag.ExitOnError)
+	socket := fs.String("socket", "", "control socket path")
+	asJSON := fs.Bool("json", false, "emit the raw list as JSON")
+	fs.Parse(args)
+
+	c := ipc.Client{Path: *socket}
+	codes, err := c.Countries(context.Background())
+	if err != nil {
+		return err
+	}
+
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(codes)
+	}
+	for _, code := range codes {
+		fmt.Println(code)
+	}
 	return nil
 }
 

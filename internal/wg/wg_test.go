@@ -172,3 +172,82 @@ func TestRedactRemovesKeyMaterial(t *testing.T) {
 		t.Errorf("AllowedIPs should be summarised, got:\n%s", redacted)
 	}
 }
+
+// TestEnsureKeepaliveAddsOneWhenTheTemplateHasNone covers the second half of
+// the bug that made the client disconnect itself every couple of minutes.
+//
+// The server's template does not always carry a PersistentKeepalive, and the
+// original code passed it through untouched. Without one, a client behind NAT
+// stops being reachable the moment the mapping goes idle: the peer has no
+// reason to send anything, so no new handshake is ever initiated, and the
+// health monitor's stale-handshake check eventually fires on a tunnel that was
+// working until the silence began.
+func TestEnsureKeepaliveAddsOneWhenTheTemplateHasNone(t *testing.T) {
+	without := strings.Replace(template, "PersistentKeepalive = 25\n", "", 1)
+	if HasKeepalive(without) {
+		t.Fatal("the fixture still has a keepalive, so this proves nothing")
+	}
+
+	got := EnsureKeepalive(without)
+	if !HasKeepalive(got) {
+		t.Fatal("EnsureKeepalive did not add one")
+	}
+	if n := strings.Count(got, "PersistentKeepalive"); n != 1 {
+		t.Errorf("PersistentKeepalive appears %d times, want exactly 1", n)
+	}
+
+	// Inside the [Peer] section, not after it. wg-quick parses this file by
+	// section, so a line that lands past the end of [Peer] is not a peer setting
+	// at all — it is silently ignored, and the tunnel behaves exactly as if it
+	// had never been written.
+	//
+	// The fixture has a trailing comment so that "inside the section" and "at
+	// the end of the file" are different places; with [Peer] last they are the
+	// same place and this would pass either way.
+	withTail := without + "\n# end\n"
+	got = EnsureKeepalive(withTail)
+	if !strings.HasSuffix(got, "# end\n") {
+		t.Errorf("the trailing content moved, so the line was not inserted in place:\n%s", got)
+	}
+	lines := strings.Split(got, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "PersistentKeepalive") {
+			if i == 0 || strings.TrimSpace(lines[i-1]) != "[Peer]" {
+				t.Errorf("PersistentKeepalive is at line %d, not directly inside the [Peer] section:\n%s", i, got)
+			}
+		}
+	}
+
+	// And the result still validates, which is the property that actually
+	// matters: an injected line must not break the config.
+	if err := Validate(got); err != nil {
+		t.Errorf("the config no longer validates after injection: %v", err)
+	}
+}
+
+// TestEnsureKeepaliveLeavesAnExistingOneAlone keeps the function idempotent.
+// Two PersistentKeepalive lines in one [Peer] is a config wg-quick rejects, so
+// a second pass over an already-patched config must be a no-op.
+func TestEnsureKeepaliveLeavesAnExistingOneAlone(t *testing.T) {
+	if !HasKeepalive(template) {
+		t.Fatal("the fixture has no keepalive to preserve")
+	}
+	got := EnsureKeepalive(template)
+	if got != template {
+		t.Errorf("a config that already sets PersistentKeepalive was rewritten:\n%s", got)
+	}
+	if n := strings.Count(got, "PersistentKeepalive"); n != 1 {
+		t.Errorf("PersistentKeepalive appears %d times, want 1", n)
+	}
+}
+
+// TestEnsureKeepaliveDoesNotInventAPeer guards the case where there is no
+// [Peer] to put it in. Appending the line to such a config would produce
+// something wg-quick reads as a stray key, which is worse than leaving it.
+func TestEnsureKeepaliveDoesNotInventAPeer(t *testing.T) {
+	noPeer := "[Interface]\nPrivateKey = aGVsbG8=\nAddress = 10.0.0.2/32\n"
+	got := EnsureKeepalive(noPeer)
+	if got != noPeer {
+		t.Errorf("EnsureKeepalive changed a config with no [Peer] section:\n%s", got)
+	}
+}
