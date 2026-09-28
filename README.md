@@ -290,28 +290,63 @@ The headless magic-link flow is designed but not built; see
 
 ## Building from source
 
-The daemon and CLI have **no external dependencies** — Go's standard library
-only, and they build with Go 1.22. The `desktop/` module is the exception, and
-it is a separate module precisely so that stays true: a tray icon needs a D-Bus
-library, and a window needs GTK.
+### What you need
 
-Building the window also needs the GTK4 development headers, and the current
-gotk4 release requires **Go 1.24 or newer**. The tray alone builds without
-either — it is pure Go and speaks D-Bus directly.
+| | Needed for | Notes |
+|---|---|---|
+| Go 1.22 or newer | everything | the root module declares 1.22.2 |
+| Go 1.24 or newer | the window | the desktop module declares 1.24.0 |
+| `libgtk-4-dev` | the window | `sudo apt install libgtk-4-dev` |
+| `nftables` | the kill switch | degrade: no filter is installed |
+| `wireguard-tools` | the tunnel | **required** — `wg` and `wg-quick` |
+| `iproute2` | the tunnel | **required** — `ip` |
+| `systemd` | wake lock, service | degrade: the machine can suspend |
+
+The daemon and CLI have **no external dependencies** — Go's standard library
+only. The `desktop/` module is the exception, and it is a separate module
+precisely so that stays true: a tray icon needs a D-Bus library, and a window
+needs GTK.
+
+**If your Go is older than 1.24, you do not need to upgrade it.** Both modules
+set `GOTOOLCHAIN=auto` behaviour by default, so building `desktop/` with Go 1.22
+makes Go fetch the 1.24 toolchain into its module cache and use it for that
+build only. That works, and it needs network access the first time. If you would
+rather control it, install Go 1.24 yourself and the download never happens.
+
+The tray alone needs neither GTK nor 1.24 — it is pure Go and speaks D-Bus
+directly. Everything except `myst-gui` builds with `CGO_ENABLED=0`.
+
+### Build
 
 ```sh
-sudo apt install libgtk-4-dev     # only needed for the window
+sudo apt install libgtk-4-dev        # only needed for the window
 
-# daemon and CLI
-go build -o mystd ./cmd/mystd
-go build -o myst  ./cmd/myst
+# daemon and CLI — static, no cgo
+CGO_ENABLED=0 go build -o mystd ./cmd/mystd
+CGO_ENABLED=0 go build -o myst  ./cmd/myst
 
-# desktop front ends — the tray applet and the GTK window
-(cd desktop && go build -o myst-tray ./cmd/myst-tray)
-(cd desktop && go build -o myst-gui  ./cmd/myst-gui)
+# tray — static, no cgo
+(cd desktop && CGO_ENABLED=0 go build -o myst-tray ./cmd/myst-tray)
 
-sudo install -m755 mystd myst myst-tray myst-gui /usr/local/bin/
-sudo install -m644 deploy/mystd.service /etc/systemd/system/
+# window — cgo, links GTK4
+(cd desktop &&               go build -o myst-gui  ./cmd/myst-gui)
+```
+
+The first build of the window takes a few minutes: gotk4 is a large generated
+cgo binding and it is compiled from scratch once. Later builds are cached.
+
+Check it before installing anything:
+
+```sh
+./mystd -h && ./myst version && ./myst-tray -h
+```
+
+### Install
+
+```sh
+sudo install -m755 mystd myst myst-tray /usr/local/bin/
+sudo install -m755 desktop/myst-gui      /usr/local/bin/
+sudo install -m644 deploy/mystd.service  /etc/systemd/system/
 sudo install -m644 desktop/myst-gui.desktop /usr/share/applications/
 
 sudo groupadd --system myst
@@ -322,10 +357,52 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now mystd
 ```
 
-Log out and back in for the group to take effect, then `myst connect`.
+The `sed` is the piece that is easy to get wrong, and it fails quietly: without
+it the daemon opens its socket `root:root`, and every front end reports
+"permission denied" while `systemctl status` says the daemon is fine. The .deb
+in Part 3 of the packaging work bakes the flag into the unit instead.
 
-The first build of the window takes a while — gotk4 is a large generated cgo
-binding and it is compiled from scratch once. Later builds are cached and fast.
+**Log out and back in** before using it — the `myst` group is only picked up by
+a new session. `id -nG` should list `myst`; if it does not, nothing you run will
+reach the daemon.
+
+Then verify, in this order:
+
+```sh
+systemctl is-active mystd      # active
+myst status                    # disconnected  (proves the socket and the group)
+myst login --from <token.json> # see "Logging in"
+myst countries | wc -l         # ~100     (proves the daemon has a working token)
+```
+
+### Rebuilding after a code change
+
+**Rebuild the daemon, not just the front end.** This has cost real debugging
+time twice: the window or CLI is rebuilt and reinstalled, the daemon is not, and
+the new client talks to an old daemon. The symptom is not an error — it is a
+front end quietly falling back to less data than it should have, because the
+daemon answered `unknown command` to something the client had every reason to
+expect.
+
+```sh
+# after changing anything under internal/ or cmd/
+go build -o /tmp/mystd ./cmd/mystd && sudo install -m755 /tmp/mystd /usr/local/bin/
+sudo systemctl restart mystd
+```
+
+`myst status` against a running daemon is the quickest way to tell what you are
+actually talking to.
+
+### Running without installing
+
+Both front ends take `-socket`, so they can drive a daemon running out of a
+checkout on a socket you own:
+
+```sh
+./mystd -socket /tmp/mystd.sock -socket-group "$(id -gn)" &
+./myst -socket /tmp/mystd.sock status
+(cd desktop && ./myst-gui)
+```
 
 ### Layout
 
