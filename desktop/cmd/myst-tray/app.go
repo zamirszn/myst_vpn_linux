@@ -33,7 +33,7 @@ const pollInterval = 5 * time.Second
 // socket, a daemon, or a D-Bus connection.
 type daemonClient interface {
 	Status(ctx context.Context) (*status, error)
-	Connect(ctx context.Context, country, ipType string) (*status, error)
+	Connect(ctx context.Context, t daemonclient.Target) (*status, error)
 	Disconnect(ctx context.Context) (*status, error)
 	Countries(ctx context.Context) ([]string, error)
 }
@@ -361,7 +361,7 @@ func (a *app) doConnect(country string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 
-		st, err := a.client.Connect(ctx, target, "")
+		st, err := a.client.Connect(ctx, daemonclient.Target{Country: target})
 		log.Printf("connect %s: err=%v", target, err)
 
 		a.mutate(func() {

@@ -65,8 +65,13 @@ func (c Client) call(ctx context.Context, req Request) (*Response, error) {
 }
 
 // Connect brings the tunnel up.
-func (c Client) Connect(ctx context.Context, country, ipType string) (*Status, error) {
-	return c.Call(ctx, Request{Command: CmdConnect, Country: country, IPType: ipType})
+func (c Client) Connect(ctx context.Context, t Target) (*Status, error) {
+	return c.Call(ctx, Request{
+		Command: CmdConnect,
+		Country: t.Country,
+		City:    t.City,
+		IPType:  t.IPType,
+	})
 }
 
 // Disconnect tears the tunnel down.
@@ -98,4 +103,31 @@ func (c Client) Countries(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	return resp.Countries, nil
+}
+
+// Locations lists every country and city the daemon's account can exit through.
+//
+// ipType selects the dataset: "residential" (the default when empty) or
+// "hosting". The daemon caches both, so this is cheap to call repeatedly — a
+// picker can ask on every open without re-fetching a megabyte.
+func (c Client) Locations(ctx context.Context, ipType string) ([]LocationCountry, error) {
+	resp, err := c.call(ctx, Request{Command: CmdLocations, IPType: ipType})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Locations, nil
+}
+
+// Login hands a token set to the daemon, which owns the credential file.
+//
+// credentials is the JSON body of an /oauth/token response. This call is how an
+// unprivileged front end logs in: it does the interactive half of the flow and
+// leaves the secret with the process that has somewhere safe to put it.
+func (c Client) Login(ctx context.Context, credentials []byte) (*Status, error) {
+	return c.Call(ctx, Request{Command: CmdLogin, Credentials: credentials})
+}
+
+// Logout tells the daemon to delete the stored credentials.
+func (c Client) Logout(ctx context.Context) (*Status, error) {
+	return c.Call(ctx, Request{Command: CmdLogout})
 }

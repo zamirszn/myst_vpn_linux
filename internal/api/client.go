@@ -128,9 +128,16 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	}
 	defer resp.Body.Close()
 
-	// Cap the read: these responses are small, and an unbounded read from a
-	// misbehaving endpoint is an easy way to exhaust memory in a root daemon.
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	// Cap the read: an unbounded read from a misbehaving endpoint is an easy way
+	// to exhaust memory in a root daemon.
+	//
+	// Not 1 MiB, which is what this was until the city list arrived:
+	// /connection/config/locations measures 1,022,666 bytes for the residential
+	// set — 2.5% under a 1 MiB ceiling. That is not headroom, it is a countdown.
+	// The moment the location list grows by a few dozen cities the body is cut
+	// mid-JSON and the failure surfaces as a decode error naming a byte offset,
+	// which says nothing about the real cause.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
 	}

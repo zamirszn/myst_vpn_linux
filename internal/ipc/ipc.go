@@ -36,13 +36,72 @@ const (
 	CmdStatus     = "status"
 	CmdPing       = "ping"
 	CmdCountries  = "countries"
+	CmdLocations  = "locations"
+	CmdLogin      = "login"
+	CmdLogout     = "logout"
 )
+
+// Target names where a tunnel should exit.
+//
+// A struct rather than three positional strings, because country, city and
+// ip_type are all short lowercase words and every ordering of them compiles.
+// The API's answer to a mixed-up filter is a 2332 "no available instance for
+// filters", which reads like an outage rather than a caller's mistake.
+//
+// Every field is optional: an empty Country lets the API choose the fastest
+// node, an empty City takes any city in the country, and an empty IPType means
+// the API's default, residential.
+type Target struct {
+	Country string
+	City    string
+	IPType  string
+}
 
 // Request is a control message from a client.
 type Request struct {
 	Command string `json:"command"`
 	Country string `json:"country,omitempty"`
+	City    string `json:"city,omitempty"`
 	IPType  string `json:"ip_type,omitempty"`
+
+	// Credentials carries a token set for CmdLogin, as the JSON the API
+	// returned.
+	//
+	// It travels inline rather than as a filename because the daemon runs as
+	// root: a root process told to open a path chosen by an unprivileged client
+	// is a symlink attack waiting to happen. The payload is a few kilobytes and
+	// crosses a socket that is already the trust boundary.
+	Credentials json.RawMessage `json:"credentials,omitempty"`
+}
+
+// LocationCity is a city a country can exit through, as sent to front ends.
+type LocationCity struct {
+	// Slug is what the connect call takes, e.g. "london". Lowercase and matched
+	// case-sensitively.
+	Slug string `json:"slug"`
+
+	// Name is the English display name, e.g. "London".
+	Name string `json:"name"`
+}
+
+// LocationCountry is a country and its cities, as sent to front ends.
+//
+// This is a trimmed projection of the API's record, which also carries
+// fourteen translations, coordinates, plan lists and node counts. Dropping
+// those takes the residential set from about a megabyte to tens of kilobytes:
+// it crosses a unix socket on every front-end start, and none of it is
+// something a picker can show.
+type LocationCountry struct {
+	// Code is the uppercase ISO code, matching the country list.
+	Code string `json:"code"`
+
+	// Name is the English display name, e.g. "United Kingdom".
+	Name string `json:"name"`
+
+	// Cities may be empty: the API serves at least one country with no cities
+	// listed. A picker must offer the country on its own rather than dropping
+	// it.
+	Cities []LocationCity `json:"cities,omitempty"`
 }
 
 // State is the tunnel's lifecycle position.
@@ -102,11 +161,14 @@ type Response struct {
 	// rather than in a response type of its own so that a single response shape
 	// stays valid for every command.
 	Countries []string `json:"countries,omitempty"`
+
+	// Locations carries the answer to CmdLocations.
+	Locations []LocationCountry `json:"locations,omitempty"`
 }
 
 // Handler is what the daemon must implement to serve IPC.
 type Handler interface {
-	Connect(ctx context.Context, country, ipType string) (*Status, error)
+	Connect(ctx context.Context, t Target) (*Status, error)
 	Disconnect(ctx context.Context) (*Status, error)
 	Status(ctx context.Context) (*Status, error)
 
@@ -118,6 +180,31 @@ type Handler interface {
 	// need its own copy of the credential, which is the split this project
 	// exists to avoid.
 	Countries(ctx context.Context) ([]string, error)
+
+	// Locations lists every country and city the account can exit through.
+	//
+	// Served from here for the same reason as Countries — it needs the token,
+	// and the token is the daemon's — and cached here as well, because the
+	// residential set is about a megabyte and a picker that re-fetched it every
+	// time it was opened would be both slow and rude to the API.
+	//
+	// ipType selects the dataset: "residential" (the default when empty) or
+	// "hosting".
+	Locations(ctx context.Context, ipType string) ([]LocationCountry, error)
+
+	// Login replaces the stored credentials with the token set in credentials,
+	// which is the JSON body of an /oauth/token response.
+	//
+	// The credential file is root-only under the daemon's state directory, so
+	// an unprivileged front end cannot write it — and should not need to, since
+	// not holding the credential is the point of this split. The front end does
+	// the part that needs a person (the magic link arrives by email) and hands
+	// the result to the process that owns the file.
+	Login(ctx context.Context, credentials []byte) (*Status, error)
+
+	// Logout deletes the stored credentials. Served from here for the same
+	// reason: the file is not the caller's to remove.
+	Logout(ctx context.Context) (*Status, error)
 }
 
 // Server listens on a unix socket and dispatches to a Handler.
@@ -261,17 +348,28 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	var (
 		status    *Status
 		countries []string
+		locations []LocationCountry
 		herr      error
 	)
 	switch req.Command {
 	case CmdConnect:
-		status, herr = s.Handler.Connect(callCtx, req.Country, req.IPType)
+		status, herr = s.Handler.Connect(callCtx, Target{
+			Country: req.Country,
+			City:    req.City,
+			IPType:  req.IPType,
+		})
 	case CmdDisconnect:
 		status, herr = s.Handler.Disconnect(callCtx)
 	case CmdStatus, CmdPing:
 		status, herr = s.Handler.Status(callCtx)
 	case CmdCountries:
 		countries, herr = s.Handler.Countries(callCtx)
+	case CmdLocations:
+		locations, herr = s.Handler.Locations(callCtx, req.IPType)
+	case CmdLogin:
+		status, herr = s.Handler.Login(callCtx, req.Credentials)
+	case CmdLogout:
+		status, herr = s.Handler.Logout(callCtx)
 	default:
 		herr = fmt.Errorf("unknown command %q", req.Command)
 	}
@@ -282,14 +380,17 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		encode(conn, Response{Error: herr.Error(), Status: status})
 		return
 	}
-	encode(conn, Response{OK: true, Status: status, Countries: countries})
+	encode(conn, Response{OK: true, Status: status, Countries: countries, Locations: locations})
 }
 
 func decodeRequest(r io.Reader) (Request, error) {
 	var req Request
-	// Cap the request: these are three fields, and an unbounded read from a
-	// root process is an easy denial of service.
-	limited := bufio.NewReader(io.LimitReader(r, 4096))
+	// Cap the request. Unbounded, this is an easy denial of service against a
+	// root process — but the ceiling has to clear a token set, which rides in
+	// on a login: an access token is a JWT of a few kilobytes, so a few hundred
+	// bytes would reject every login. 16 KiB is roomy for a token and still
+	// four orders of magnitude short of anything worth worrying about.
+	limited := bufio.NewReader(io.LimitReader(r, 16<<10))
 	if err := json.NewDecoder(limited).Decode(&req); err != nil {
 		return Request{}, fmt.Errorf("decode request: %w", err)
 	}

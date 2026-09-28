@@ -15,19 +15,26 @@ import (
 type stubHandler struct {
 	connected   bool
 	connectErr  error
-	lastCountry string
+	lastTarget  Target
 
 	countries    []string
 	countriesErr error
+
+	locations    []LocationCountry
+	locationsErr error
+	askedIPType  string
+
+	credentials []byte
+	loggedOut   bool
 }
 
-func (h *stubHandler) Connect(_ context.Context, country, _ string) (*Status, error) {
-	h.lastCountry = country
+func (h *stubHandler) Connect(_ context.Context, t Target) (*Status, error) {
+	h.lastTarget = t
 	if h.connectErr != nil {
 		return nil, h.connectErr
 	}
 	h.connected = true
-	return &Status{State: StateConnected, Country: country}, nil
+	return &Status{State: StateConnected, Country: t.Country, City: t.City}, nil
 }
 
 func (h *stubHandler) Disconnect(context.Context) (*Status, error) {
@@ -47,6 +54,24 @@ func (h *stubHandler) Countries(context.Context) ([]string, error) {
 		return nil, h.countriesErr
 	}
 	return h.countries, nil
+}
+
+func (h *stubHandler) Locations(_ context.Context, ipType string) ([]LocationCountry, error) {
+	h.askedIPType = ipType
+	if h.locationsErr != nil {
+		return nil, h.locationsErr
+	}
+	return h.locations, nil
+}
+
+func (h *stubHandler) Login(_ context.Context, credentials []byte) (*Status, error) {
+	h.credentials = credentials
+	return &Status{State: StateDisconnected}, nil
+}
+
+func (h *stubHandler) Logout(context.Context) (*Status, error) {
+	h.loggedOut = true
+	return &Status{State: StateDisconnected}, nil
 }
 
 // serve starts a server on a temporary socket and returns a client for it.
@@ -74,7 +99,7 @@ func TestConnectRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	st, err := c.Connect(ctx, "gb", "hosting")
+	st, err := c.Connect(ctx, Target{Country: "gb", IPType: "hosting"})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -84,8 +109,11 @@ func TestConnectRoundTrip(t *testing.T) {
 	if st.Country != "gb" {
 		t.Errorf("country = %q, want gb", st.Country)
 	}
-	if h.lastCountry != "gb" {
-		t.Errorf("handler saw country %q, want gb", h.lastCountry)
+	if h.lastTarget.Country != "gb" {
+		t.Errorf("handler saw country %q, want gb", h.lastTarget.Country)
+	}
+	if h.lastTarget.IPType != "hosting" {
+		t.Errorf("handler saw ip type %q, want hosting", h.lastTarget.IPType)
 	}
 }
 
@@ -96,7 +124,7 @@ func TestStatusAfterConnect(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if _, err := c.Connect(ctx, "de", ""); err != nil {
+	if _, err := c.Connect(ctx, Target{Country: "de"}); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	st, err := c.Status(ctx)
@@ -126,7 +154,7 @@ func TestHandlerErrorReachesTheClient(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err := c.Connect(ctx, "gb", "")
+	_, err := c.Connect(ctx, Target{Country: "gb"})
 	if err == nil {
 		t.Fatal("expected the handler's error to surface")
 	}
@@ -143,6 +171,52 @@ func TestUnknownCommandIsRejected(t *testing.T) {
 
 	if _, err := c.Call(ctx, Request{Command: "self-destruct"}); err == nil {
 		t.Fatal("expected an unknown command to be rejected")
+	}
+}
+
+// TestLoginCarriesATokenSetIntact is aimed squarely at the request size cap.
+//
+// A real access token is a JWT of a few kilobytes. If the ceiling is set for
+// the handful of short strings the other commands send, every login fails —
+// and it fails by decoding a truncated request, so the error names a JSON
+// syntax problem rather than a size limit, which is a miserable thing to
+// debug. This sends a token of a realistic size and checks it arrives byte for
+// byte.
+func TestLoginCarriesATokenSetIntact(t *testing.T) {
+	h := &stubHandler{}
+	c := serve(t, h)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Roughly the shape and size of a real /oauth/token response.
+	credentials := []byte(`{"access_token":"` + strings.Repeat("e", 3000) +
+		`","refresh_token":"` + strings.Repeat("r", 200) +
+		`","token_type":"Bearer","expires_in":2592000}`)
+	if len(credentials) < 3000 {
+		t.Fatal("the fixture is not big enough to prove anything")
+	}
+
+	if _, err := c.Login(ctx, credentials); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if got := string(h.credentials); got != string(credentials) {
+		t.Errorf("the token set arrived changed: %d bytes in, %d bytes out", len(credentials), len(got))
+	}
+}
+
+func TestLogoutReachesTheHandler(t *testing.T) {
+	h := &stubHandler{}
+	c := serve(t, h)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := c.Logout(ctx); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	if !h.loggedOut {
+		t.Error("the handler never saw the logout")
 	}
 }
 

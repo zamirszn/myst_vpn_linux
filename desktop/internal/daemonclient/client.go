@@ -42,6 +42,7 @@ const (
 type request struct {
 	Command string `json:"command"`
 	Country string `json:"country,omitempty"`
+	City    string `json:"city,omitempty"`
 	IPType  string `json:"ip_type,omitempty"`
 }
 
@@ -53,6 +54,31 @@ type response struct {
 	// Countries answers the "countries" command. It rides alongside Status so
 	// one response shape stays valid for every command.
 	Countries []string `json:"countries,omitempty"`
+
+	// Locations answers the "locations" command, by the same arrangement.
+	Locations []LocationCountry `json:"locations,omitempty"`
+}
+
+// LocationCity is a city the account can exit through.
+type LocationCity struct {
+	// Slug is what the connect request takes, e.g. "london".
+	Slug string `json:"slug"`
+
+	// Name is the English display name, e.g. "London".
+	Name string `json:"name"`
+}
+
+// LocationCountry is a country and the cities within it.
+type LocationCountry struct {
+	// Code is the uppercase ISO code, matching what Countries returns.
+	Code string `json:"code"`
+
+	// Name is the English display name, e.g. "United Kingdom".
+	Name string `json:"name"`
+
+	// Cities is empty for a country the API lists without cities, which is
+	// still a valid choice — the country on its own.
+	Cities []LocationCity `json:"cities,omitempty"`
 }
 
 // Status mirrors ipc.Status, restricted to what a front end displays.
@@ -127,9 +153,23 @@ func (c Client) Status(ctx context.Context) (*Status, error) {
 	return c.Call(ctx, request{Command: "status"})
 }
 
-// Connect brings a tunnel up, optionally in a named country.
-func (c Client) Connect(ctx context.Context, country, ipType string) (*Status, error) {
-	return c.Call(ctx, request{Command: "connect", Country: country, IPType: ipType})
+// Target names where a tunnel should exit. An empty field is a preference not
+// expressed: no country lets the API choose the fastest node, no city takes any
+// city in the country.
+type Target struct {
+	Country string
+	City    string
+	IPType  string
+}
+
+// Connect brings a tunnel up in the requested region.
+func (c Client) Connect(ctx context.Context, t Target) (*Status, error) {
+	return c.Call(ctx, request{
+		Command: "connect",
+		Country: t.Country,
+		City:    t.City,
+		IPType:  t.IPType,
+	})
 }
 
 // Disconnect tears the tunnel down.
@@ -149,4 +189,21 @@ func (c Client) Countries(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	return resp.Countries, nil
+}
+
+// Locations lists the countries and cities the account can exit through.
+//
+// ipType selects the dataset: "residential" (the default when empty) or
+// "hosting". They are genuinely different lists rather than one filtered view —
+// 106 countries against 49 — which is why the picker offers them as separate
+// groups rather than as a filter.
+//
+// The daemon caches both, so calling this whenever a picker opens costs
+// nothing after the first time.
+func (c Client) Locations(ctx context.Context, ipType string) ([]LocationCountry, error) {
+	resp, err := c.call(ctx, request{Command: "locations", IPType: ipType})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Locations, nil
 }

@@ -123,6 +123,14 @@ func (f *fakeTunnel) calls() (up, down int) {
 	return f.upCalls, f.downCalls
 }
 
+// upCount reports how many times the interface was brought up, which is how a
+// test tells a rebuilt tunnel from one that was left alone.
+func (f *fakeTunnel) upCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.upCalls
+}
+
 // interfaceUp reports whether the fake interface currently exists.
 func (f *fakeTunnel) interfaceUp() bool {
 	f.mu.Lock()
@@ -160,6 +168,10 @@ type fakeAPI struct {
 	configErr   error
 	disconnects int
 	lastReq     api.WireguardConnectRequest
+
+	locations       map[string][]api.LocationCountry
+	locationsErr    error
+	locationFetches int
 }
 
 func (f *fakeAPI) Config(context.Context) (*api.ConnectionConfig, error) {
@@ -171,6 +183,37 @@ func (f *fakeAPI) Config(context.Context) (*api.ConnectionConfig, error) {
 	return f.configResp, nil
 }
 
+// Locations serves the canned list for an ip type, counting the fetches so a
+// test can prove the cache is doing its job.
+func (f *fakeAPI) Locations(_ context.Context, ipType string) ([]api.LocationCountry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.locationFetches++
+	if f.locationsErr != nil {
+		return nil, f.locationsErr
+	}
+	key := ipType
+	if key == "" {
+		key = "residential"
+	}
+	return f.locations[key], nil
+}
+
+// locationFetchCount reports how many times the API was actually asked, which
+// is what distinguishes a cache hit from a cache miss.
+func (f *fakeAPI) locationFetchCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.locationFetches
+}
+
+// failLocationsFrom makes every later location fetch fail.
+func (f *fakeAPI) failLocationsFrom(err error) {
+	f.mu.Lock()
+	f.locationsErr = err
+	f.mu.Unlock()
+}
+
 func (f *fakeAPI) Connect(_ context.Context, req api.WireguardConnectRequest) (*api.WireguardConnectResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -178,7 +221,23 @@ func (f *fakeAPI) Connect(_ context.Context, req api.WireguardConnectRequest) (*
 	if f.connectErr != nil {
 		return nil, f.connectErr
 	}
-	return f.connectResp, nil
+
+	// Echo back what was asked for, as the real API does — a field the request
+	// left empty keeps the canned default, standing in for the server choosing
+	// for itself. Without the echo a test cannot tell a client that sent the
+	// city from one that dropped it: the response would say "gloucester" either
+	// way, and the assertion would pass on a client that never sends a city.
+	resp := *f.connectResp
+	if req.Country != "" {
+		resp.Country = req.Country
+	}
+	if req.City != "" {
+		resp.City = req.City
+	}
+	if req.IPType != "" {
+		resp.IPType = req.IPType
+	}
+	return &resp, nil
 }
 
 func (f *fakeAPI) Disconnect(context.Context) error {
@@ -362,7 +421,7 @@ func newTestDaemon(t *testing.T, tune func(*Config, *testEnv, *Deps)) *testEnv {
 func TestConnectBringsTunnelUp(t *testing.T) {
 	env := newTestDaemon(t, nil)
 
-	st, err := env.d.Connect(context.Background(), "gb", "hosting")
+	st, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb", IPType: "hosting"})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -423,7 +482,7 @@ func TestConnectBringsTunnelUp(t *testing.T) {
 func TestConnectArmsTheKillSwitch(t *testing.T) {
 	env := newTestDaemon(t, nil)
 
-	st, err := env.d.Connect(context.Background(), "gb", "")
+	st, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -453,7 +512,7 @@ func TestKillSwitchIsArmedBeforeTheInterfaceComesUp(t *testing.T) {
 		deps.Tunnel = &trackingTunnel{inner: e.tun, onUp: func() { armedWhenUpRan = e.ks.installed }}
 	})
 
-	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	if !armedWhenUpRan {
@@ -464,7 +523,7 @@ func TestKillSwitchIsArmedBeforeTheInterfaceComesUp(t *testing.T) {
 func TestDisconnectDisarmsTheKillSwitch(t *testing.T) {
 	env := newTestDaemon(t, nil)
 
-	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	st, err := env.d.Disconnect(context.Background())
@@ -486,7 +545,7 @@ func TestFailedConnectDisarmsTheKillSwitch(t *testing.T) {
 		e.tun.neverHandshakes()
 	})
 
-	if _, err := env.d.Connect(context.Background(), "gb", ""); err == nil {
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err == nil {
 		t.Fatal("expected the connect to fail")
 	}
 	if env.ks.installed {
@@ -504,7 +563,7 @@ func TestKillSwitchFailureAbortsTheConnect(t *testing.T) {
 		e.ks.installErr = errors.New("nft: permission denied")
 	})
 
-	st, err := env.d.Connect(context.Background(), "gb", "")
+	st, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"})
 	if err == nil {
 		t.Fatal("expected the connect to fail when the kill switch cannot be armed")
 	}
@@ -521,7 +580,7 @@ func TestKillSwitchDisabledDoesNotArm(t *testing.T) {
 		c.KillSwitch = false
 	})
 
-	st, err := env.d.Connect(context.Background(), "gb", "")
+	st, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -538,7 +597,7 @@ func TestConnectRollsBackWhenHandshakeNeverCompletes(t *testing.T) {
 		e.tun.neverHandshakes() // interface up, peer silent
 	})
 
-	st, err := env.d.Connect(context.Background(), "gb", "")
+	st, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"})
 	if err == nil {
 		t.Fatal("expected an error when the tunnel never handshakes")
 	}
@@ -562,10 +621,10 @@ func TestConnectRollsBackWhenHandshakeNeverCompletes(t *testing.T) {
 func TestConnectIsIdempotent(t *testing.T) {
 	env := newTestDaemon(t, nil)
 
-	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {
 		t.Fatalf("first Connect: %v", err)
 	}
-	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {
 		t.Fatalf("second Connect: %v", err)
 	}
 	if env.tun.upCalls != 1 {
@@ -576,10 +635,10 @@ func TestConnectIsIdempotent(t *testing.T) {
 func TestConnectToAnotherRegionTearsDownFirst(t *testing.T) {
 	env := newTestDaemon(t, nil)
 
-	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {
 		t.Fatalf("first Connect: %v", err)
 	}
-	if _, err := env.d.Connect(context.Background(), "de", ""); err != nil {
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "de"}); err != nil {
 		t.Fatalf("second Connect: %v", err)
 	}
 	if env.tun.downCalls != 1 {
@@ -593,7 +652,7 @@ func TestConnectToAnotherRegionTearsDownFirst(t *testing.T) {
 func TestDisconnectReleasesEverything(t *testing.T) {
 	env := newTestDaemon(t, nil)
 
-	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
@@ -621,7 +680,7 @@ func TestDisconnectReleasesEverything(t *testing.T) {
 func TestStatusDetectsVanishedInterface(t *testing.T) {
 	env := newTestDaemon(t, nil)
 
-	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	if !env.ks.armed() {
@@ -686,7 +745,7 @@ func TestStatusDoesNotPreemptTheMonitor(t *testing.T) {
 		c.MonitorInterval = time.Hour
 	})
 
-	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
@@ -720,7 +779,7 @@ func TestWakeLockFailureDoesNotBlockConnect(t *testing.T) {
 		}
 	})
 
-	st, err := env.d.Connect(context.Background(), "gb", "")
+	st, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"})
 	if err != nil {
 		t.Fatalf("a missing wake lock must not fail the connect: %v", err)
 	}
@@ -737,7 +796,7 @@ func TestConnectSurfacesProvisioningFailure(t *testing.T) {
 		e.api.connectErr = errors.New("account has no device slots left")
 	})
 
-	st, err := env.d.Connect(context.Background(), "gb", "")
+	st, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"})
 	if err == nil {
 		t.Fatal("expected the provisioning error to surface")
 	}
@@ -781,7 +840,7 @@ func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool)
 func TestMonitorReconnectsAfterTheNetworkChanges(t *testing.T) {
 	env := newTestDaemon(t, func(c *Config, _ *testEnv, _ *Deps) { monitorOn(c) })
 
-	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
@@ -815,7 +874,7 @@ func TestMonitorReconnectsAfterTheHandshakeGoesStale(t *testing.T) {
 		c.StaleAfter = 50 * time.Millisecond
 	})
 
-	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
@@ -854,7 +913,7 @@ func TestMonitorReconnectsAfterTheHandshakeGoesStale(t *testing.T) {
 func TestMonitorLeavesAHealthyIdleTunnelAlone(t *testing.T) {
 	env := newTestDaemon(t, func(c *Config, _ *testEnv, _ *Deps) { monitorOn(c) })
 
-	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
@@ -913,7 +972,7 @@ func TestStaleThresholdOutlastsTheRekeyCycle(t *testing.T) {
 func TestMonitorReturnsTheNetworkWhenRecoveryKeepsFailing(t *testing.T) {
 	env := newTestDaemon(t, func(c *Config, _ *testEnv, _ *Deps) { monitorOn(c) })
 
-	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	if !env.ks.armed() {
@@ -951,7 +1010,7 @@ func TestMonitorStaysOffWhenDisabled(t *testing.T) {
 		c.MonitorInterval = 5 * time.Millisecond
 	})
 
-	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	env.tun.setRoute(wg.Route{Gateway: "192.168.1.1", Interface: "wlo1"})
@@ -965,7 +1024,7 @@ func TestMonitorStaysOffWhenDisabled(t *testing.T) {
 func TestConnectStartsTheMonitorAndDisconnectStopsIt(t *testing.T) {
 	env := newTestDaemon(t, func(c *Config, _ *testEnv, _ *Deps) { monitorOn(c) })
 
-	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	if !env.monitorRunning() {
@@ -983,7 +1042,7 @@ func TestConnectStartsTheMonitorAndDisconnectStopsIt(t *testing.T) {
 func TestStatusDoesNotWaitForAnOperationInFlight(t *testing.T) {
 	env := newTestDaemon(t, nil)
 
-	if _, err := env.d.Connect(context.Background(), "gb", ""); err != nil {
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
@@ -1074,7 +1133,7 @@ func TestNoServerInRegionIsExplained(t *testing.T) {
 		}
 	})
 
-	_, err := env.d.Connect(context.Background(), "us", "")
+	_, err := env.d.Connect(context.Background(), ipc.Target{Country: "us"})
 	if err == nil {
 		t.Fatal("Connect reported success against an API that refused the region")
 	}
@@ -1105,11 +1164,345 @@ func TestNoServerAnywhereIsExplained(t *testing.T) {
 		}
 	})
 
-	_, err := env.d.Connect(context.Background(), "", "")
+	_, err := env.d.Connect(context.Background(), ipc.Target{})
 	if err == nil {
 		t.Fatal("Connect reported success against an API that refused the region")
 	}
 	if msg := err.Error(); !strings.Contains(msg, "try again") {
 		t.Errorf("the error gives the user nothing to do: %q", msg)
+	}
+}
+
+// --- Cities ---------------------------------------------------------------
+
+// locationFixture is a small stand-in for the API's location list: two
+// countries, one of them with cities and one without, matching the real
+// response's shape.
+func locationFixture() map[string][]api.LocationCountry {
+	return map[string][]api.LocationCountry{
+		"residential": {
+			{
+				Country:      "GB",
+				Translations: map[string]string{"en": "United Kingdom", "de": "Vereinigtes Königreich"},
+				Cities: []api.LocationCity{
+					{City: "london", Translations: map[string]string{"en": "London"}},
+					{City: "manchester", Translations: map[string]string{"en": "Manchester"}},
+				},
+			},
+			{
+				// The API really does serve a country with no cities listed.
+				Country:      "AD",
+				Translations: map[string]string{"en": "Andorra"},
+			},
+		},
+		"hosting": {
+			{
+				Country:      "GB",
+				Translations: map[string]string{"en": "United Kingdom"},
+				Cities: []api.LocationCity{
+					{City: "london", Translations: map[string]string{"en": "London"}},
+				},
+			},
+		},
+	}
+}
+
+func withLocations(t *testing.T) *testEnv {
+	t.Helper()
+	return newTestDaemon(t, func(_ *Config, env *testEnv, _ *Deps) {
+		env.api.locations = locationFixture()
+	})
+}
+
+func TestConnectSendsTheCityToTheAPI(t *testing.T) {
+	env := withLocations(t)
+
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb", City: "london"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if got := env.api.lastRequest().City; got != "london" {
+		t.Errorf("the API was asked for city %q, want london — picking a city would silently connect to any city in the country", got)
+	}
+	if got := env.api.lastRequest().Country; got != "gb" {
+		t.Errorf("country = %q, want gb", got)
+	}
+}
+
+// TestPickingADifferentCityRebuildsTheTunnel is the whole point of the city
+// picker. If the idempotence check only compared countries, choosing Manchester
+// while sitting in London would return the London tunnel and look, to the user,
+// like the picker did nothing.
+func TestPickingADifferentCityRebuildsTheTunnel(t *testing.T) {
+	env := withLocations(t)
+
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb", City: "london"}); err != nil {
+		t.Fatalf("Connect london: %v", err)
+	}
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb", City: "manchester"}); err != nil {
+		t.Fatalf("Connect manchester: %v", err)
+	}
+
+	if got := env.api.lastRequest().City; got != "manchester" {
+		t.Errorf("city = %q, want manchester", got)
+	}
+	if up := env.tun.upCount(); up != 2 {
+		t.Errorf("the interface was brought up %d times, want 2 — the tunnel was not rebuilt for the new city", up)
+	}
+}
+
+// TestReconnectingToTheSameCityIsANoOp keeps connecting idempotent, which is
+// what stops a front end's poll from tearing down a working tunnel.
+func TestReconnectingToTheSameCityIsANoOp(t *testing.T) {
+	env := withLocations(t)
+
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb", City: "london"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "GB", City: "london"}); err != nil {
+		t.Fatalf("Connect again: %v", err)
+	}
+
+	if up := env.tun.upCount(); up != 1 {
+		t.Errorf("the interface was brought up %d times, want 1 — a repeat connect rebuilt a working tunnel", up)
+	}
+}
+
+// TestSwitchingIPTypeRebuildsTheTunnel covers a quieter bug: residential and
+// hosting are different pools, and asking for one while connected on the other
+// used to be ignored entirely.
+func TestSwitchingIPTypeRebuildsTheTunnel(t *testing.T) {
+	env := withLocations(t)
+
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb", IPType: "residential"}); err != nil {
+		t.Fatalf("Connect residential: %v", err)
+	}
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb", IPType: "hosting"}); err != nil {
+		t.Fatalf("Connect hosting: %v", err)
+	}
+
+	if got := env.api.lastRequest().IPType; got != "hosting" {
+		t.Errorf("ip type = %q, want hosting — switching pools was silently ignored", got)
+	}
+}
+
+// TestLeavingTheCityUnsetIsAPreferenceNotADemand pins the wildcard rule: asking
+// for "any city in GB" while sitting in GB/London is a match, because an
+// unexpressed preference is not a request to move.
+func TestLeavingTheCityUnsetIsAPreferenceNotADemand(t *testing.T) {
+	env := withLocations(t)
+
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb", City: "london"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {
+		t.Fatalf("Connect without a city: %v", err)
+	}
+
+	if up := env.tun.upCount(); up != 1 {
+		t.Errorf("the interface was brought up %d times, want 1 — clearing a city preference rebuilt the tunnel", up)
+	}
+}
+
+func TestLocationsAreTrimmedForThePicker(t *testing.T) {
+	env := withLocations(t)
+
+	locs, err := env.d.Locations(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Locations: %v", err)
+	}
+	if len(locs) != 2 {
+		t.Fatalf("got %d countries, want 2", len(locs))
+	}
+
+	gb := locs[0]
+	if gb.Code != "GB" {
+		t.Errorf("code = %q, want GB", gb.Code)
+	}
+	// The English label, not the raw code and not the German translation.
+	if gb.Name != "United Kingdom" {
+		t.Errorf("name = %q, want the English label", gb.Name)
+	}
+	if len(gb.Cities) != 2 {
+		t.Fatalf("got %d cities, want 2", len(gb.Cities))
+	}
+	if gb.Cities[0].Slug != "london" || gb.Cities[0].Name != "London" {
+		t.Errorf("city = %+v, want the slug and its English name", gb.Cities[0])
+	}
+
+	// A country with no cities still has to appear: dropping it would make it
+	// unselectable, when connecting to the country alone is perfectly valid.
+	if ad := locs[1]; ad.Code != "AD" || len(ad.Cities) != 0 {
+		t.Errorf("the city-less country = %+v, want AD with no cities", ad)
+	}
+}
+
+// TestLocationListIsCached is the behaviour the picker depends on. The
+// residential list is about a megabyte; fetching it every time a dropdown opens
+// would be slow and rude to the API.
+func TestLocationListIsCached(t *testing.T) {
+	env := withLocations(t)
+
+	for i := 0; i < 4; i++ {
+		if _, err := env.d.Locations(context.Background(), "residential"); err != nil {
+			t.Fatalf("Locations call %d: %v", i, err)
+		}
+	}
+	if got := env.api.locationFetchCount(); got != 1 {
+		t.Errorf("the API was asked %d times for the same list, want 1 — the cache is not being used", got)
+	}
+
+	// The other dataset is a different list, not a filtered view of the first,
+	// so it must be fetched in its own right.
+	if _, err := env.d.Locations(context.Background(), "hosting"); err != nil {
+		t.Fatalf("Locations(hosting): %v", err)
+	}
+	if got := env.api.locationFetchCount(); got != 2 {
+		t.Errorf("fetch count = %d, want 2 — the two ip types should not share a cache entry", got)
+	}
+}
+
+// TestTheDefaultIPTypeIsCachedUnderItsRealName guards a cache that looks like
+// it works but fetches twice: the API treats an absent ip_type as residential,
+// so asking with "" and with "residential" is the same request.
+func TestTheDefaultIPTypeIsCachedUnderItsRealName(t *testing.T) {
+	env := withLocations(t)
+
+	if _, err := env.d.Locations(context.Background(), ""); err != nil {
+		t.Fatalf("Locations(\"\"): %v", err)
+	}
+	if _, err := env.d.Locations(context.Background(), "residential"); err != nil {
+		t.Fatalf("Locations(residential): %v", err)
+	}
+
+	if got := env.api.locationFetchCount(); got != 1 {
+		t.Errorf("fetch count = %d, want 1 — an empty ip type and \"residential\" are the same list", got)
+	}
+}
+
+// TestAStaleListBeatsNoList covers the API having a bad minute. Emptying the
+// picker is a worse failure than offering a city that was retired this morning,
+// and the connect call still has the final say on whether a city exists.
+func TestAStaleListBeatsNoList(t *testing.T) {
+	env := withLocations(t)
+
+	if _, err := env.d.Locations(context.Background(), "residential"); err != nil {
+		t.Fatalf("warm the cache: %v", err)
+	}
+
+	// Expire the entry and break the API.
+	env.d.locsMu.Lock()
+	entry := env.d.locs["residential"]
+	entry.fetched = time.Now().Add(-2 * DefaultLocationsTTL)
+	env.d.locs["residential"] = entry
+	env.d.locsMu.Unlock()
+	env.api.failLocationsFrom(errors.New("api is down"))
+
+	locs, err := env.d.Locations(context.Background(), "residential")
+	if err != nil {
+		t.Fatalf("a cached list should have been served: %v", err)
+	}
+	if len(locs) != 2 {
+		t.Errorf("got %d countries from the cache, want 2", len(locs))
+	}
+}
+
+// TestNoCacheAndNoAPIIsAnError is the other half: with nothing cached there is
+// nothing to serve, and the caller has to hear about it rather than being
+// handed an empty picker that looks like an account with no countries.
+func TestNoCacheAndNoAPIIsAnError(t *testing.T) {
+	env := newTestDaemon(t, func(_ *Config, env *testEnv, _ *Deps) {
+		env.api.locationsErr = errors.New("api is down")
+	})
+
+	if _, err := env.d.Locations(context.Background(), "residential"); err == nil {
+		t.Fatal("an empty result was reported as success")
+	}
+}
+
+// TestSwitchingAccountsDropsTheCachedCities keeps a per-account list from
+// outliving the account. The new account would otherwise be offered the old
+// one's cities, which fails at connect time with no hint as to why.
+func TestSwitchingAccountsDropsTheCachedCities(t *testing.T) {
+	env := withLocations(t)
+
+	if _, err := env.d.Locations(context.Background(), "residential"); err != nil {
+		t.Fatalf("warm the cache: %v", err)
+	}
+	if got := env.api.locationFetchCount(); got != 1 {
+		t.Fatalf("fetch count = %d, want 1", got)
+	}
+
+	if _, err := env.d.Login(context.Background(), []byte(`{"access_token":"other-account"}`)); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	if _, err := env.d.Locations(context.Background(), "residential"); err != nil {
+		t.Fatalf("Locations after login: %v", err)
+	}
+	if got := env.api.locationFetchCount(); got != 2 {
+		t.Errorf("fetch count = %d, want 2 — the previous account's cities survived the account switch", got)
+	}
+}
+
+// TestRecoveryRebuildsTheSameCity keeps the health monitor from quietly moving
+// the user. A tunnel that dies in Manchester must come back in Manchester, not
+// anywhere in the country the monitor happened to record.
+func TestRecoveryRebuildsTheSameCity(t *testing.T) {
+	env := newTestDaemon(t, func(c *Config, env *testEnv, _ *Deps) {
+		monitorOn(c)
+		env.api.locations = locationFixture()
+	})
+
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb", City: "manchester"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// The tunnel stops answering.
+	env.tun.setHandshake(time.Now().Add(-time.Hour))
+	waitFor(t, 3*time.Second, "the monitor to rebuild the tunnel", func() bool {
+		return env.tun.upCount() >= 2
+	})
+
+	if got := env.api.lastRequest().City; got != "manchester" {
+		t.Errorf("the recovery asked for city %q, want manchester — the tunnel came back somewhere the user did not choose", got)
+	}
+}
+
+// TestRecoveryOfACityLessConnectStaysBroad is the other half of the rule above,
+// and the reason it is a rule rather than a coincidence.
+//
+// Asked for a country and nothing more, the API assigns whichever city it
+// likes — "gloucester" in the fixture. A recovery that echoed that back would
+// pin the reconnect to one city, so a country with a hundred free cities could
+// fail to recover because that one was full. The user never chose it, so it
+// should not narrow anything.
+//
+// With the API echoing what it is asked for, this cannot be told apart from the
+// test above by inspecting the response alone; it is the *request* that has to
+// stay empty.
+func TestRecoveryOfACityLessConnectStaysBroad(t *testing.T) {
+	env := newTestDaemon(t, func(c *Config, env *testEnv, _ *Deps) {
+		monitorOn(c)
+		env.api.locations = locationFixture()
+	})
+
+	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	// The API chose for us, and said so.
+	if st := env.d.snapshot(); st.City == "" {
+		t.Fatal("the fixture assigned no city, so this proves nothing")
+	}
+
+	env.tun.setHandshake(time.Now().Add(-time.Hour))
+	waitFor(t, 3*time.Second, "the monitor to rebuild the tunnel", func() bool {
+		return env.tun.upCount() >= 2
+	})
+
+	if got := env.api.lastRequest().City; got != "" {
+		t.Errorf("the recovery asked for city %q — a city the user never chose was pinned onto the reconnect, narrowing it for no reason", got)
+	}
+	if got := env.api.lastRequest().Country; got != "gb" {
+		t.Errorf("the recovery asked for country %q, want gb", got)
 	}
 }

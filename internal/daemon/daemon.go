@@ -10,6 +10,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -49,6 +50,10 @@ type Provisioner interface {
 	// interface rather than a separate dependency because it is the same
 	// authenticated client, built from the same token.
 	Config(ctx context.Context) (*api.ConnectionConfig, error)
+
+	// Locations reports the countries and cities the account can reach, for the
+	// same reason and by the same client.
+	Locations(ctx context.Context, ipType string) ([]api.LocationCountry, error)
 }
 
 // APIFor builds a Provisioner for an access token. A function rather than a
@@ -181,6 +186,10 @@ type Config struct {
 	// up and returns the network.
 	MaxRecoveryAttempts int
 	RecoveryWindow      time.Duration
+
+	// LocationsTTL is how long a fetched location list is served from cache.
+	// Zero means DefaultLocationsTTL.
+	LocationsTTL time.Duration
 }
 
 // Deps are the daemon's collaborators. Tests substitute fakes here.
@@ -238,13 +247,41 @@ type Daemon struct {
 	// baseline is the default route the tunnel came up on. A later change means
 	// the machine moved networks and the tunnel is dead.
 	baseline string
+
+	// locsMu guards locs, the cached location lists. It is deliberately not mu:
+	// a cache miss costs a network round trip of up to thirty seconds, and mu
+	// must never be held across anything slower than a field assignment or
+	// `myst status` stops answering while the picker loads.
+	//
+	// Lock order is opMu, then locsMu, then mu. Nothing takes opMu while
+	// holding either of the others.
+	locsMu sync.Mutex
+	locs   map[string]locationEntry
 }
 
 // region is a connection target, as the API understands it.
 type region struct {
 	country string
+	city    string
 	ipType  string
 }
+
+// locationEntry is a cached location list and when it was fetched.
+type locationEntry struct {
+	fetched time.Time
+	items   []ipc.LocationCountry
+}
+
+// DefaultLocationsTTL is how long a cached location list is served before it is
+// fetched again.
+//
+// Long, because this list is close to static — nodes come and go hourly, but
+// countries and cities change on the scale of weeks. The cost of being stale is
+// that a picker briefly offers a city that has just been retired, which the
+// connect call then rejects with the same 2332 error any unavailable region
+// gives. The cost of being short is re-downloading a megabyte every time
+// someone opens a dropdown.
+const DefaultLocationsTTL = 6 * time.Hour
 
 // teardown's keepWakeLock argument, named so the call sites state their intent.
 const (
@@ -284,6 +321,9 @@ func New(cfg Config, deps Deps) *Daemon {
 	if cfg.RecoveryWindow == 0 {
 		cfg.RecoveryWindow = DefaultRecoveryWindow
 	}
+	if cfg.LocationsTTL == 0 {
+		cfg.LocationsTTL = DefaultLocationsTTL
+	}
 
 	if deps.Logger == nil {
 		deps.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -322,6 +362,7 @@ func New(cfg Config, deps Deps) *Daemon {
 		ks:     deps.KillSwitch,
 		log:    deps.Logger,
 		status: ipc.Status{State: ipc.StateDisconnected},
+		locs:   map[string]locationEntry{},
 	}
 }
 
@@ -332,7 +373,7 @@ func defaultLock(ctx context.Context, why string) (Lock, error) {
 
 // Connect brings the tunnel up, or returns the current status if it is already
 // up in the requested region.
-func (d *Daemon) Connect(ctx context.Context, country, ipType string) (*ipc.Status, error) {
+func (d *Daemon) Connect(ctx context.Context, t ipc.Target) (*ipc.Status, error) {
 	d.opMu.Lock()
 	defer d.opMu.Unlock()
 
@@ -342,10 +383,7 @@ func (d *Daemon) Connect(ctx context.Context, country, ipType string) (*ipc.Stat
 	d.stopMonitor()
 
 	if st := d.snapshot(); st.State == ipc.StateConnected {
-		// Compared case-insensitively: a caller may pass "gb" while the status
-		// carries the API's canonical "GB". A case mismatch here would tear
-		// down a working tunnel and rebuild it in the region it is already in.
-		if country == "" || strings.EqualFold(country, st.Country) {
+		if sameTarget(t, st) {
 			return d.snapshot(), nil // already there; connecting is idempotent
 		}
 		// A different region was asked for, so the current tunnel has to go.
@@ -356,7 +394,7 @@ func (d *Daemon) Connect(ctx context.Context, country, ipType string) (*ipc.Stat
 
 	d.setState(ipc.StateConnecting, "")
 
-	st, err := d.bringUp(ctx, country, ipType)
+	st, err := d.bringUp(ctx, t)
 	if err != nil {
 		// Roll back whatever did come up. A half-connected daemon is worse than
 		// a disconnected one: the interface may be carrying traffic with no
@@ -372,7 +410,7 @@ func (d *Daemon) Connect(ctx context.Context, country, ipType string) (*ipc.Stat
 	}
 
 	d.publish(*st)
-	d.noteTarget(st)
+	d.noteTarget(t, st)
 	d.noteBaseline(ctx)
 	d.startMonitor()
 
@@ -385,6 +423,152 @@ func (d *Daemon) Connect(ctx context.Context, country, ipType string) (*ipc.Stat
 		"wake_lock", st.WakeLock,
 	)
 	return d.snapshot(), nil
+}
+
+// sameTarget reports whether the live tunnel already serves what t asks for.
+//
+// An empty field in t is a preference not expressed, not a demand for a
+// region with no country — the API reads it as "you choose". So asking for
+// "any city in GB" while sitting in GB/London is a match, and does not cost the
+// user a needless reconnect.
+//
+// Comparing the ip type as well as the country fixes a quieter bug: switching
+// between residential and hosting in the same country used to be silently
+// ignored, leaving the user on the ip type they were trying to leave.
+func sameTarget(t ipc.Target, st *ipc.Status) bool {
+	matches := func(requested, current string) bool {
+		return requested == "" || strings.EqualFold(requested, current)
+	}
+	return matches(t.Country, st.Country) &&
+		matches(t.City, st.City) &&
+		matches(t.IPType, st.IPType)
+}
+
+// noServerError explains a 2332 in terms the user can act on.
+//
+// The API returns "no available instance for filters" for a region that is
+// genuinely out of nodes *and* for a filter that named nothing at all — a city
+// slug in the wrong case, or an ip_type with no capacity in that country. So
+// this names the most specific part of the target, which is the likeliest
+// culprit, without claiming to know which of those it was.
+func noServerError(t ipc.Target) error {
+	hint := " — try another region, or connect without a country to let the client pick the fastest"
+	if strings.EqualFold(t.IPType, "hosting") {
+		// The data centre pool is a third the size of the residential one — 49
+		// countries against 106 — so an exhausted city here is ordinary rather
+		// than exceptional, and saying so beats "try again shortly".
+		hint = " — the data centre pool is much smaller than the residential one, so try another city or switch to residential"
+	}
+
+	switch {
+	case t.City != "" && t.Country != "":
+		return fmt.Errorf("no servers are available in %q (%s) right now%s", t.City, t.Country, hint)
+	case t.Country != "":
+		return fmt.Errorf("no servers are available in %q at the moment%s", t.Country, hint)
+	default:
+		return errors.New("no servers are available at the moment — try again shortly")
+	}
+}
+
+// Locations lists every country and city the account can exit through, from the
+// cache when it is warm.
+//
+// Like Countries, and for the same reason, it does not take opMu: filling a
+// region picker has nothing to do with the tunnel, and blocking it behind a
+// two-minute connect would leave the picker empty for exactly as long as the
+// user is waiting to connect.
+func (d *Daemon) Locations(ctx context.Context, ipType string) ([]ipc.LocationCountry, error) {
+	key := normalizeIPType(ipType)
+
+	d.locsMu.Lock()
+	defer d.locsMu.Unlock()
+
+	if entry, ok := d.locs[key]; ok {
+		if age := time.Since(entry.fetched); age < d.cfg.LocationsTTL {
+			d.log.Debug("serving cached locations", "ip_type", key, "age", age.Round(time.Second), "countries", len(entry.items))
+			return entry.items, nil
+		}
+	}
+
+	items, err := d.fetchLocations(ctx, ipType)
+	if err != nil {
+		// A stale list beats no list. The alternative is a picker that empties
+		// itself whenever the API has a bad minute, which is a worse failure
+		// than offering a city that was retired this morning — and it is the
+		// connect call, not the picker, that has the final say on whether a
+		// city still exists.
+		if entry, ok := d.locs[key]; ok {
+			d.log.Warn("could not refresh locations; serving the cached list",
+				"ip_type", key, "age", time.Since(entry.fetched).Round(time.Minute), "err", err)
+			return entry.items, nil
+		}
+		return nil, err
+	}
+
+	d.locs[key] = locationEntry{fetched: time.Now(), items: items}
+	d.log.Info("locations fetched", "ip_type", key, "countries", len(items))
+	return items, nil
+}
+
+// fetchLocations retrieves and trims the location list. Caller holds locsMu.
+func (d *Daemon) fetchLocations(ctx context.Context, ipType string) ([]ipc.LocationCountry, error) {
+	tok, err := d.tokens.EnsureValid(ctx, d.store, d.cfg.RefreshMargin)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := d.apiFor(tok.AccessToken).Locations(ctx, ipType)
+	if err != nil {
+		return nil, fmt.Errorf("list locations: %w", err)
+	}
+
+	// Project down to what a picker can draw. The API's record carries fourteen
+	// translations, coordinates, plan lists and node counts per entry; none of
+	// it is showable and all of it is multiplied by 1720 cities.
+	out := make([]ipc.LocationCountry, 0, len(raw))
+	for _, country := range raw {
+		if country.Country == "" {
+			continue // nothing to connect to and nothing to label
+		}
+		c := ipc.LocationCountry{
+			Code: country.Country,
+			Name: api.EnglishName(country.Translations, country.Country),
+		}
+		for _, city := range country.Cities {
+			if city.City == "" {
+				continue
+			}
+			c.Cities = append(c.Cities, ipc.LocationCity{
+				Slug: city.City,
+				Name: api.EnglishName(city.Translations, city.City),
+			})
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// normalizeIPType maps an empty or oddly-cased ip type onto the key the cache
+// and the API both use.
+//
+// Empty means residential to the API, so it has to mean residential here too —
+// otherwise asking for "" and for "residential" would fetch the same megabyte
+// twice and cache it under two names.
+func normalizeIPType(ipType string) string {
+	t := strings.ToLower(strings.TrimSpace(ipType))
+	if t == "" {
+		return "residential"
+	}
+	return t
+}
+
+// forgetLocations drops the cached location lists.
+//
+// Called when the account changes: the lists are per-account, so leaving them
+// in place would offer the previous account's cities to the new one.
+func (d *Daemon) forgetLocations() {
+	d.locsMu.Lock()
+	defer d.locsMu.Unlock()
+	d.locs = map[string]locationEntry{}
 }
 
 // Countries lists the country codes the account can connect to.
@@ -410,7 +594,7 @@ func (d *Daemon) Countries(ctx context.Context) ([]string, error) {
 }
 
 // bringUp performs the full connect sequence. Caller holds opMu.
-func (d *Daemon) bringUp(ctx context.Context, country, ipType string) (*ipc.Status, error) {
+func (d *Daemon) bringUp(ctx context.Context, t ipc.Target) (*ipc.Status, error) {
 	tok, err := d.tokens.EnsureValid(ctx, d.store, d.cfg.RefreshMargin)
 	if err != nil {
 		return nil, err
@@ -425,8 +609,9 @@ func (d *Daemon) bringUp(ctx context.Context, country, ipType string) (*ipc.Stat
 
 	resp, err := client.Connect(ctx, api.WireguardConnectRequest{
 		PublicKey: kp.PublicKey,
-		IPType:    ipType,
-		Country:   country,
+		IPType:    t.IPType,
+		Country:   t.Country,
+		City:      t.City,
 	})
 	if err != nil {
 		// A country with no node free is not a server fault, though the API
@@ -434,10 +619,7 @@ func (d *Daemon) bringUp(ctx context.Context, country, ipType string) (*ipc.Stat
 		// who picks another region and one who concludes the client is broken.
 		var apiErr *api.APIError
 		if errors.As(err, &apiErr) && apiErr.IsNoServerInRegion() {
-			if country != "" {
-				return nil, fmt.Errorf("no servers are available in %q at the moment — try another region, or connect without --country to let the client pick the fastest", country)
-			}
-			return nil, errors.New("no servers are available at the moment — try again shortly")
+			return nil, noServerError(t)
 		}
 		return nil, fmt.Errorf("provision tunnel: %w", err)
 	}
@@ -811,7 +993,11 @@ func (d *Daemon) rebuild(ctx context.Context, reason string) bool {
 			d.log.Warn("could not fully clear the dead tunnel", "err", err)
 		}
 
-		st, err := d.bringUp(ctx, target.country, target.ipType)
+		st, err := d.bringUp(ctx, ipc.Target{
+			Country: target.country,
+			City:    target.city,
+			IPType:  target.ipType,
+		})
 		if err == nil {
 			d.publish(*st)
 			d.noteBaseline(ctx)
@@ -843,7 +1029,12 @@ func (d *Daemon) rebuild(ctx context.Context, reason string) bool {
 func (d *Daemon) Disconnect(ctx context.Context) (*ipc.Status, error) {
 	d.opMu.Lock()
 	defer d.opMu.Unlock()
+	return d.disconnectLocked(ctx)
+}
 
+// disconnectLocked is Disconnect without the lock, for callers that already
+// hold opMu. Caller holds opMu.
+func (d *Daemon) disconnectLocked(ctx context.Context) (*ipc.Status, error) {
 	d.stopMonitor()
 
 	err := d.teardown(ctx, releaseWakeLock)
@@ -854,6 +1045,72 @@ func (d *Daemon) Disconnect(ctx context.Context) (*ipc.Status, error) {
 		return d.snapshot(), err
 	}
 	d.log.Info("tunnel down")
+	return d.snapshot(), nil
+}
+
+// Login replaces the stored credentials.
+//
+// The credentials live in a root-only file under the daemon's state directory,
+// so this is the only unprivileged route to writing them. Nothing is cached:
+// every operation loads the token from disk, so a new account takes effect on
+// the next connect without restarting the daemon.
+func (d *Daemon) Login(ctx context.Context, credentials []byte) (*ipc.Status, error) {
+	var tok auth.Token
+	if err := json.Unmarshal(credentials, &tok); err != nil {
+		return nil, fmt.Errorf("that is not a token set: %w", err)
+	}
+	if tok.AccessToken == "" {
+		return nil, errors.New("that token set has no access_token")
+	}
+	if tok.ObtainedAt.IsZero() {
+		tok.ObtainedAt = time.Now()
+	}
+
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
+
+	// Close any tunnel first, and do it on the old credentials.
+	//
+	// Order matters. The disconnect call tells the API to release the
+	// connection, and it has to name the account that opened it. Overwriting
+	// the token first would ask the *new* account to release a connection it
+	// never made, so the old one would stay registered until it timed out on
+	// its own — a leak the user cannot see and did not ask for.
+	if st := d.snapshot(); st.State == ipc.StateConnected || st.State == ipc.StateReconnecting {
+		if _, err := d.disconnectLocked(ctx); err != nil {
+			return d.snapshot(), fmt.Errorf("a tunnel is up and could not be closed before switching accounts: %w", err)
+		}
+	}
+
+	if err := d.store.Save(&tok); err != nil {
+		return nil, fmt.Errorf("store credentials: %w", err)
+	}
+	// The location lists are per-account. Keeping them would offer the previous
+	// account's cities to the new one, which looks like a stale picker rather
+	// than a credential change.
+	d.forgetLocations()
+	d.log.Info("credentials replaced")
+	return d.snapshot(), nil
+}
+
+// Logout deletes the stored credentials, closing any tunnel first.
+func (d *Daemon) Logout(ctx context.Context) (*ipc.Status, error) {
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
+
+	// Same ordering as Login: release the account's connection while the token
+	// that opened it is still on disk.
+	if st := d.snapshot(); st.State == ipc.StateConnected || st.State == ipc.StateReconnecting {
+		if _, err := d.disconnectLocked(ctx); err != nil {
+			return d.snapshot(), fmt.Errorf("a tunnel is up and could not be closed: %w", err)
+		}
+	}
+
+	if err := d.store.Delete(); err != nil {
+		return nil, err
+	}
+	d.forgetLocations()
+	d.log.Info("credentials removed")
 	return d.snapshot(), nil
 }
 
@@ -989,9 +1246,24 @@ func (d *Daemon) takeHeld() Lock {
 }
 
 // noteTarget records the region the live tunnel serves.
-func (d *Daemon) noteTarget(st *ipc.Status) {
+// noteTarget records where the live tunnel serves, so a recovery rebuilds the
+// same place rather than quietly landing the user somewhere they did not ask
+// for.
+//
+// The country and ip type come from the status, because the API canonicalises
+// them — the country is folded to uppercase ISO, and an absent ip type comes
+// back as "residential". Feeding a differently-cased code back would fail the
+// filter outright.
+//
+// The city comes from what was *asked for*, not what was assigned, and the
+// difference is deliberate. When the user named a city, that choice has to
+// survive a recovery. When they asked only for a country, the city the API
+// picked is an implementation detail — pinning the recovery to it would narrow
+// a reconnect that has every reason to be broad, and could fail for want of one
+// city when the country has others free.
+func (d *Daemon) noteTarget(t ipc.Target, st *ipc.Status) {
 	d.mu.Lock()
-	d.conn = region{country: st.Country, ipType: st.IPType}
+	d.conn = region{country: st.Country, city: t.City, ipType: st.IPType}
 	d.mu.Unlock()
 }
 

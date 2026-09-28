@@ -28,6 +28,7 @@ commands:
   disconnect   tear the tunnel down
   status       report the current state
   countries    list the countries this account can connect to
+  locations    list the countries and cities this account can connect to
   login        import credentials from a captured token
   logout       delete stored credentials
   version      print the version
@@ -54,6 +55,8 @@ func main() {
 		err = cmdStatus(args)
 	case "countries":
 		err = cmdCountries(args)
+	case "locations":
+		err = cmdLocations(args)
 	case "login":
 		err = cmdLogin(args)
 	case "logout":
@@ -78,11 +81,16 @@ func cmdConnect(args []string) error {
 	fs := flag.NewFlagSet("connect", flag.ExitOnError)
 	socket := fs.String("socket", "", "control socket path")
 	country := fs.String("country", "", "exit country code, e.g. gb (default: let the API choose)")
+	city := fs.String("city", "", "exit city slug, e.g. london (default: any city in the country)")
 	ipType := fs.String("ip-type", "", "ip type preference, e.g. hosting or residential")
 	fs.Parse(args)
 
 	c := ipc.Client{Path: *socket}
-	st, err := c.Connect(context.Background(), *country, *ipType)
+	st, err := c.Connect(context.Background(), ipc.Target{
+		Country: *country,
+		City:    *city,
+		IPType:  *ipType,
+	})
 	if err != nil {
 		if st != nil {
 			printStatus(st)
@@ -152,6 +160,47 @@ func cmdCountries(args []string) error {
 	}
 	for _, code := range codes {
 		fmt.Println(code)
+	}
+	return nil
+}
+
+// cmdLocations prints the countries and cities the account can exit through.
+//
+// The API serves this as a single list of countries, each carrying its cities,
+// which is what the picker needs — a country with no cities is still a valid
+// choice, so the two lists cannot be flattened into one.
+func cmdLocations(args []string) error {
+	fs := flag.NewFlagSet("locations", flag.ExitOnError)
+	socket := fs.String("socket", "", "control socket path")
+	ipType := fs.String("ip-type", "", "residential (default) or hosting")
+	asJSON := fs.Bool("json", false, "emit the raw list as JSON")
+	citiesOnly := fs.Bool("cities", false, "print country and city slugs only, one per line")
+	fs.Parse(args)
+
+	c := ipc.Client{Path: *socket}
+	locs, err := c.Locations(context.Background(), *ipType)
+	if err != nil {
+		return err
+	}
+
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(locs)
+	}
+
+	for _, country := range locs {
+		if *citiesOnly {
+			for _, city := range country.Cities {
+				fmt.Printf("%s\t%s\n", country.Code, city.Slug)
+			}
+			continue
+		}
+		fmt.Printf("%s  %s", country.Code, country.Name)
+		if n := len(country.Cities); n > 0 {
+			fmt.Printf("  (%d cities)", n)
+		}
+		fmt.Println()
 	}
 	return nil
 }

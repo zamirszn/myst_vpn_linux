@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -84,6 +85,61 @@ func (c *Client) Config(ctx context.Context) (*ConnectionConfig, error) {
 		return nil, err
 	}
 	return &out, nil
+}
+
+// LocationCity is one city a country can exit through.
+type LocationCity struct {
+	// City is the slug the connect call takes, e.g. "london". Lowercase, and
+	// matched case-sensitively — "London" is not the same filter and comes back
+	// as a 2332 no-servers error rather than a validation complaint.
+	City string `json:"city"`
+
+	// Translations carries the display name under every locale the API serves.
+	// We read the "en" entry; see LocationCountry.Name.
+	Translations map[string]string `json:"translations"`
+}
+
+// LocationCountry is a country and the cities within it.
+type LocationCountry struct {
+	// Country is the uppercase ISO code, matching the country list.
+	Country string `json:"country"`
+
+	Translations map[string]string `json:"translations"`
+
+	Cities []LocationCity `json:"cities"`
+}
+
+// EnglishName picks the English label, falling back to the raw identifier.
+//
+// The field is a map of fourteen locales, of which this client uses one. The
+// fallback matters: a country whose translations have not been filled in should
+// still appear in the picker, labelled with its code, rather than vanish.
+func EnglishName(translations map[string]string, fallback string) string {
+	if name, ok := translations["en"]; ok && name != "" {
+		return name
+	}
+	return fallback
+}
+
+// Locations returns every country and city the account can exit through.
+//
+// ipType selects which dataset: "residential" (the default when empty, and by
+// far the larger — 106 countries and 1720 cities, against 49 and 149), or
+// "hosting". They are genuinely different lists rather than one filtered view,
+// which is why this takes the parameter rather than filtering client-side.
+//
+// The residential response is about a megabyte, so callers should cache it.
+func (c *Client) Locations(ctx context.Context, ipType string) ([]LocationCountry, error) {
+	path := "/connection/config/locations"
+	if ipType != "" {
+		path += "?ip_type=" + url.QueryEscape(ipType)
+	}
+
+	var out []LocationCountry
+	if err := c.do(ctx, "GET", path, nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // Region is a regional relay the client connects through.
