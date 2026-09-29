@@ -44,6 +44,7 @@ func run() error {
 	var (
 		socket  = flag.String("socket", defaultSocketPath, "path to the daemon's control socket")
 		country = flag.String("country", "", "region to connect to; changeable from the menu")
+		city    = flag.String("city", "", "city slug within -country, e.g. london; changeable from the menu")
 	)
 	flag.Parse()
 
@@ -54,6 +55,12 @@ func run() error {
 	defer conn.Close()
 
 	a := newApp(conn, client{Path: *socket}, *country)
+	if *city != "" && *country != "" {
+		// A city means nothing without its country, so it is ignored alone
+		// rather than sent as a filter the API would match against every
+		// country and fail on.
+		a.mutate(func() { a.city = *city })
+	}
 
 	// The well-known name is the tray convention, and the watcher records it so
 	// the panel can tell items apart.
@@ -101,6 +108,7 @@ func run() error {
 	// rather than a placeholder for the first interval. The country list is
 	// asked for alongside it, and asked again on each tick until it arrives.
 	a.loadCountries(ctx)
+	a.loadPlaces(ctx)
 	a.refresh(ctx)
 
 	ticker := time.NewTicker(pollInterval)
@@ -114,6 +122,7 @@ func run() error {
 			return nil
 		case <-ticker.C:
 			a.loadCountries(ctx)
+			a.loadPlaces(ctx)
 			a.refresh(ctx)
 		}
 	}

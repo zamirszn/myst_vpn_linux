@@ -20,6 +20,8 @@ type (
 	status = daemonclient.Status
 
 	region = regionlist.Region
+	place  = regionlist.Place
+	city   = regionlist.City
 )
 
 const (
@@ -42,4 +44,22 @@ var (
 	fromCodes  = regionlist.FromCodes
 	regionName = regionlist.Name
 	titleCase  = regionlist.TitleCase
+
+	citiesOf = regionlist.CitiesOf
+	cityName = regionlist.CityName
 )
+
+// fromLocations turns the daemon's location answer into the menu's data. The
+// conversion lives here, at the boundary, so the regions package does not have
+// to import the client.
+func fromLocations(in []daemonclient.LocationCountry) []place {
+	raw := make([]regionlist.RawCountry, 0, len(in))
+	for _, c := range in {
+		rc := regionlist.RawCountry{Code: c.Code, Name: c.Name}
+		for _, ct := range c.Cities {
+			rc.Cities = append(rc.Cities, regionlist.RawCity{Slug: ct.Slug, Name: ct.Name})
+		}
+		raw = append(raw, rc)
+	}
+	return regionlist.FromLocations(raw)
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -46,6 +47,7 @@ type window struct {
 	detail  *gtk.Label
 	action  *gtk.Button
 	region  *gtk.DropDown
+	city    *gtk.DropDown
 	note    *gtk.Label
 	exitIP  *gtk.Label
 	copy    *gtk.Button
@@ -85,6 +87,22 @@ type window struct {
 	// it a daemon that accepts connections but never answers would accumulate a
 	// goroutine per poll.
 	loadingCountries atomic.Bool
+
+	// places is the country/city data once the daemon has answered "locations".
+	// Cities are a separate, larger request from the plain country list, so a
+	// daemon too old to serve them costs the window nothing beyond having no
+	// city picker: countries alone keep working exactly as before.
+	places     []regions.Place
+	havePlaces atomic.Bool
+
+	// loadingPlaces keeps one locations request in flight at a time, for the
+	// same reason loadingCountries does.
+	loadingPlaces atomic.Bool
+
+	// cityChoice is the picked city's slug, remembered across a country change
+	// so switching country and back does not lose it. Only the main loop
+	// touches it.
+	cityChoice string
 }
 
 func newWindow(app *gtk.Application, client daemonclient.Client) *window {
@@ -117,6 +135,18 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	// own and about five times longer, replaces it as soon as it arrives.
 	w.choices = regions.All
 	w.region = gtk.NewDropDownFromStrings(w.pickerLabels())
+	w.region.NotifyProperty("selected", func() {
+		w.refreshCityPicker()
+		w.applyCitySensitivity()
+	})
+
+	// "Any city" is the only entry until a country with cities is picked.
+	w.city = gtk.NewDropDownFromStrings([]string{"Any city"})
+	w.city.SetSensitive(false)
+	w.city.NotifyProperty("selected", func() {
+		cities := regions.CitiesOf(w.places, w.selectedRegion())
+		w.cityChoice = regions.CitySlugAt(cities, int(w.city.Selected()))
+	})
 
 	// Says so when the picker is on the built-in fallback rather than the
 	// account's real list. Without it the two are indistinguishable, and a
@@ -141,6 +171,7 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	body.Append(w.detail)
 	body.Append(w.action)
 	body.Append(w.region)
+	body.Append(w.city)
 	body.Append(w.note)
 	body.Append(gtk.NewSeparator(gtk.OrientationHorizontal))
 	body.Append(w.details())
@@ -150,8 +181,10 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	// Ask immediately so the window opens on the real state rather than a
 	// placeholder, then keep asking.
 	w.poll()
+	w.loadPlaces()
 	glib.TimeoutAdd(uint(pollInterval.Milliseconds()), func() bool {
 		w.poll()
+		w.loadPlaces()
 		return true // keep the timer running
 	})
 
@@ -255,14 +288,118 @@ func (w *window) toggle() {
 		})
 		return
 	}
+	w.cityChoice = w.selectedCity()
 	w.run(func(ctx context.Context) (*daemonclient.Status, error) {
-		return w.client.Connect(ctx, w.selectedRegion(), "")
+		return w.client.Connect(ctx, daemonclient.Target{Country: w.selectedRegion(), City: w.cityChoice})
 	})
 }
 
 // selectedRegion is the country code currently chosen in the picker, or "" to
 // let the API choose the fastest.
 func (w *window) selectedRegion() string { return regionCodeAt(w.choices, int(w.region.Selected())) }
+
+// selectedCity is the city slug currently chosen, or "" for any city in the
+// country. Empty whenever the current country has no city list, so a picker
+// left on a stale row from a previous country can never leak into a request.
+func (w *window) selectedCity() string {
+	code := w.selectedRegion()
+	cities := regions.CitiesOf(w.places, code)
+	if len(cities) == 0 {
+		return ""
+	}
+	return regions.CitySlugAt(cities, int(w.city.Selected()))
+}
+
+// refreshCityPicker rebuilds the city dropdown's list for whatever country the
+// region dropdown currently shows, and restores the remembered city choice
+// within it if the new list still has it.
+//
+// Call this only when the underlying city data actually changes shape: a
+// different country selected, or the daemon's location list arriving for the
+// first time. It must NOT be called on every routine status poll — replacing
+// the model resets the dropdown's selection, and if that ran on a timer it
+// would silently discard whatever city the user had just clicked before the
+// next tick landed, which is exactly the bug this split fixes.
+//
+// A city slug that does not belong to the selected country's list (the normal
+// case right after picking a different country) simply is not found by
+// CityRow, which returns row 0, "Any city" — so there is no need to clear
+// cityChoice on a country change; it just stops matching anything until the
+// user, or a synced connected status, sets it to one that does.
+func (w *window) refreshCityPicker() {
+	cities := regions.CitiesOf(w.places, w.selectedRegion())
+	if len(cities) == 0 {
+		w.city.SetModel(gtk.NewStringList([]string{"Any city"}))
+		return
+	}
+	labels := make([]string, 0, len(cities)+1)
+	labels = append(labels, "Any city")
+	for _, c := range cities {
+		labels = append(labels, c.Name)
+	}
+	w.city.SetModel(gtk.NewStringList(labels))
+	w.city.SetSelected(regions.CityRow(cities, w.cityChoice))
+}
+
+// pickerEnabled is whether the region and city dropdowns may be used: while an
+// operation of ours is in flight, or while a tunnel is actually up and changing
+// region would have nothing to attach to.
+func (w *window) pickerEnabled() bool {
+	return !w.busy.Load() && w.onScreen().State != daemonclient.StateConnected
+}
+
+// applyCitySensitivity is the city dropdown's enabled state, recomputed on its
+// own — safe to call on every poll, unlike refreshCityPicker, because it never
+// touches the model or the selection, only whether the control can be used.
+func (w *window) applyCitySensitivity() {
+	w.city.SetSensitive(w.pickerEnabled() && len(regions.CitiesOf(w.places, w.selectedRegion())) > 0)
+}
+
+// loadPlaces pulls the account's country/city data from the daemon. It mirrors
+// loadCountries in every respect: off the main loop, one attempt at a time,
+// asked for only until it succeeds, and silent on failure — the countries
+// picker already works without it.
+func (w *window) loadPlaces() {
+	if w.havePlaces.Load() {
+		return
+	}
+	if !w.loadingPlaces.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer w.loadingPlaces.Store(false)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		locs, err := w.client.Locations(ctx, "")
+		if err != nil || len(locs) == 0 {
+			log.Printf("locations: countries=%d err=%v", len(locs), err)
+			return
+		}
+		log.Printf("locations: got %d countries", len(locs))
+		raw := make([]regions.RawCountry, 0, len(locs))
+		for _, c := range locs {
+			rc := regions.RawCountry{Code: c.Code, Name: c.Name}
+			for _, ct := range c.Cities {
+				rc.Cities = append(rc.Cities, regions.RawCity{Slug: ct.Slug, Name: ct.Name})
+			}
+			raw = append(raw, rc)
+		}
+		list := regions.FromLocations(raw)
+		if len(list) == 0 {
+			return
+		}
+		w.onMain(func() {
+			if w.havePlaces.Swap(true) {
+				return // a slower earlier request beat us to it
+			}
+			w.places = list
+			w.refreshCityPicker() // the current country may now have cities
+			w.applyCitySensitivity()
+		})
+	}()
+}
 
 // fillRegions replaces the picker's contents with a country list, keeping the
 // "Fastest" entry at row 0.
@@ -411,10 +548,17 @@ func (w *window) apply(st daemonclient.Status) {
 
 	// A region is chosen before connecting and cannot be changed underneath a
 	// live tunnel, so the picker is live only when there is nothing to disturb.
-	w.region.SetSensitive(!busy && st.State != daemonclient.StateConnected)
+	regionEnabled := !busy && st.State != daemonclient.StateConnected
+	w.region.SetSensitive(regionEnabled)
 	if st.State == daemonclient.StateConnected {
+		// Set before selectRegion: if that actually changes the picker's row it
+		// fires the region's own notify handler, which rebuilds the city list
+		// from whatever cityChoice already holds — so it has to be the
+		// connected city by that point, not the choice from before connecting.
+		w.cityChoice = st.City
 		w.selectRegion(st.Country)
 	}
+	w.applyCitySensitivity()
 
 	w.exitIP.SetText(orDash(st.ExitIP))
 	w.copy.SetSensitive(st.State == daemonclient.StateConnected && st.ExitIP != "")
@@ -503,7 +647,7 @@ func (w *window) copyExitIP() {
 func (w *window) regionLine(st daemonclient.Status) string {
 	name := regions.Name(st.Country)
 	if st.City != "" {
-		name += " · " + regions.TitleCase(st.City)
+		name += " · " + regions.CityName(w.places, st.Country, st.City)
 	}
 	if st.IPType != "" {
 		name += " · " + st.IPType

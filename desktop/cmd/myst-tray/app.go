@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
+
+	"github.com/zamirszn/mysterium-linux-client/desktop/internal/daemonclient"
 )
 
 // D-Bus names and paths this applet owns.
@@ -36,6 +38,7 @@ type daemonClient interface {
 	Connect(ctx context.Context, t daemonclient.Target) (*status, error)
 	Disconnect(ctx context.Context) (*status, error)
 	Countries(ctx context.Context) ([]string, error)
+	Locations(ctx context.Context, ipType string) ([]daemonclient.LocationCountry, error)
 }
 
 // app is the shared state behind both D-Bus objects. Every mutation goes
@@ -62,6 +65,12 @@ type app struct {
 	// country is the region the user picked, remembered across connects.
 	country string
 
+	// city is the city slug the user picked inside country, or "" for any city
+	// in it. It is remembered like country, and cleared whenever a country is
+	// chosen without one, so picking Germany after London does not ask for
+	// London, Germany.
+	city string
+
 	// choices is the country list the Region submenu offers — the account's own
 	// list once the daemon has answered, and the built-in fallback until then.
 	//
@@ -83,6 +92,23 @@ type app struct {
 	// soon as it can. loadingCountries keeps one request in flight at a time.
 	haveCountries    bool
 	loadingCountries bool
+
+	// places is what the daemon said each country's cities are. It is asked for
+	// separately from the country list because it is a much larger answer, and
+	// because a daemon too old to serve it must not cost the menu its countries:
+	// without places every country is simply a plain entry, as before.
+	//
+	// cityIDs and cityTargets are the two directions of the mapping between a
+	// city and its menu id, and belong to the city for the reason regionIDs
+	// belongs to the country. groupIDs names the submenu parent of a country
+	// that has cities; nothing maps back from it, so a click on a parent that a
+	// host reports anyway connects nowhere.
+	places        []place
+	cityIDs       map[string]int32
+	cityTargets   map[int32]cityTarget
+	groupIDs      map[string]int32
+	havePlaces    bool
+	loadingPlaces bool
 
 	// busy is true while a connect or disconnect is in flight. The daemon
 	// serialises commands behind one mutex, so polling status during a connect
@@ -115,6 +141,10 @@ func newApp(conn *dbus.Conn, c daemonClient, country string) *app {
 		regionIDs:    map[string]int32{},
 		regionCodes:  map[int32]string{},
 		nextRegionID: idRegionBase,
+
+		cityIDs:     map[string]int32{},
+		cityTargets: map[int32]cityTarget{},
+		groupIDs:    map[string]int32{},
 	}
 	if conn != nil {
 		a.emitTo = conn.Emit
@@ -170,8 +200,8 @@ func (a *app) syncLocked() {
 	// exit IP, a different selected region, a country list that arrived from the
 	// daemon. Hashing what the menu actually shows keeps the revision honest
 	// without every caller remembering to bump it.
-	menuKey := fmt.Sprintf("%t|%s|%s|%s|%s|%d",
-		a.reachable, a.st.State, a.st.Country, a.st.ExitIP, a.country, a.choicesSeq)
+	menuKey := fmt.Sprintf("%t|%s|%s|%s|%s|%s|%s|%d",
+		a.reachable, a.st.State, a.st.Country, a.st.City, a.st.ExitIP, a.country, a.city, a.choicesSeq)
 	if menuKey != a.menuFor {
 		a.menuFor = menuKey
 		a.rev++
@@ -188,7 +218,7 @@ func (a *app) tooltipLocked() string {
 		if a.st.Country != "" {
 			b.WriteString("\n" + regionName(a.st.Country))
 			if a.st.City != "" {
-				b.WriteString(" · " + titleCase(a.st.City))
+				b.WriteString(" · " + cityName(a.places, a.st.Country, a.st.City))
 			}
 		}
 		if a.st.ExitIP != "" {
@@ -216,7 +246,7 @@ func (a *app) tooltipLocked() string {
 		}
 		return "Mysterium VPN — error\n" + msg
 	default:
-		return "Mysterium VPN — not connected\nClick to connect to " + regionName(a.country)
+		return "Mysterium VPN — not connected\nClick to connect to " + a.targetNameLocked()
 	}
 }
 
@@ -306,6 +336,59 @@ func (a *app) loadCountries(ctx context.Context) {
 	}()
 }
 
+// targetNameLocked names where a click on the icon would connect: the chosen
+// city and country, or just the country, or "the fastest region". Caller holds
+// mu.
+func (a *app) targetNameLocked() string {
+	name := regionName(a.country)
+	if a.city != "" && a.country != "" {
+		name = cityName(a.places, a.country, a.city) + ", " + name
+	}
+	return name
+}
+
+// loadPlaces asks the daemon which cities each country has and puts them in the
+// menu.
+//
+// It follows loadCountries in every respect that matters: off the caller's
+// goroutine, one request in flight, asked for only until it succeeds, and silent
+// about failure — a daemon that cannot answer already says so at the top of the
+// menu, and the countries stay usable without their cities. It asks for the
+// residential list because that is what the applet connects with; the hosting
+// list is a different, smaller dataset the applet never offers.
+func (a *app) loadPlaces(ctx context.Context) {
+	a.mu.Lock()
+	if a.havePlaces || a.loadingPlaces {
+		a.mu.Unlock()
+		return
+	}
+	a.loadingPlaces = true
+	a.mu.Unlock()
+
+	go func() {
+		cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+
+		locs, err := a.client.Locations(cctx, "")
+
+		a.mutate(func() {
+			a.loadingPlaces = false
+			if err != nil || len(locs) == 0 {
+				log.Printf("locations: countries=%d err=%v", len(locs), err)
+				return
+			}
+			log.Printf("locations: got %d countries", len(locs))
+			list := fromLocations(locs)
+			if len(list) == 0 {
+				return
+			}
+			a.havePlaces = true
+			a.places = list
+			a.choicesSeq++ // the menu changed shape, and no state field says so
+		})
+	}()
+}
+
 // refresh asks the daemon for its state and folds the answer in.
 func (a *app) refresh(ctx context.Context) {
 	a.mu.Lock()
@@ -338,9 +421,20 @@ func (a *app) refresh(ctx context.Context) {
 	})
 }
 
-// doConnect asks the daemon to bring the tunnel up. The call can take a minute,
+// doConnect connects to a country, or to the remembered choice when country is
+// empty. It is connectTo without a city, which is what every caller that has
+// only a country means.
+func (a *app) doConnect(country string) { a.connectTo(country, "") }
+
+// connectTo asks the daemon to bring the tunnel up. The call can take a minute,
 // so it runs off the D-Bus handler goroutine entirely.
-func (a *app) doConnect(country string) {
+//
+// A non-empty country is a fresh choice, and replaces the remembered city along
+// with the remembered country: the city belongs to the country it was picked
+// in, and carrying it into another would ask for a place that does not exist.
+// An empty country means "what I chose last", city included — which is what a
+// click on the icon does.
+func (a *app) connectTo(country, cityChoice string) {
 	a.mu.Lock()
 	if a.busy {
 		a.mu.Unlock()
@@ -349,20 +443,21 @@ func (a *app) doConnect(country string) {
 	a.busy = true
 	if country != "" {
 		a.country = country
+		a.city = cityChoice
 	}
-	target := a.country
+	target := daemonclient.Target{Country: a.country, City: a.city}
 	a.mu.Unlock()
 
 	a.mutate(func() {
-		a.st = status{State: stateConnecting, Country: target}
+		a.st = status{State: stateConnecting, Country: target.Country, City: target.City}
 	})
 
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 
-		st, err := a.client.Connect(ctx, daemonclient.Target{Country: target})
-		log.Printf("connect %s: err=%v", target, err)
+		st, err := a.client.Connect(ctx, target)
+		log.Printf("connect %s/%s: err=%v", target.Country, target.City, err)
 
 		a.mutate(func() {
 			a.busy = false

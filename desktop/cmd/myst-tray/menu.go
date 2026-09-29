@@ -52,9 +52,61 @@ func (a *app) idForRegion(code string) int32 {
 // regionForID is the reverse, used when a click comes in. The bool reports
 // whether the id names a country at all, so a stale click from a panel that has
 // not caught up is ignored rather than guessed at.
+//
+// It takes the lock itself: it is called from the D-Bus Event handler, while a
+// GetLayout on another goroutine may be adding ids to the same map, and an
+// unsynchronised read of a map being written is a crash, not a stale answer.
 func (a *app) regionForID(id int32) (string, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	code, ok := a.regionCodes[id]
 	return code, ok
+}
+
+// cityTarget is a country and one of its cities, which is what a click on a
+// city entry means.
+type cityTarget struct{ country, city string }
+
+// idForCity returns the menu id for a city, allocating one the first time it is
+// seen. Caller holds a.mu.
+//
+// Keyed by country and slug, never by row, for the reason idForRegion is: the
+// list can change under a panel that has not re-read it, and an id that named a
+// position would then name a different city. The slug is used exactly as the
+// API spelled it, because the API matches it literally.
+func (a *app) idForCity(code, slug string) int32 {
+	code = strings.ToUpper(strings.TrimSpace(code))
+	key := code + "/" + slug
+	if id, ok := a.cityIDs[key]; ok {
+		return id
+	}
+	id := a.nextRegionID
+	a.nextRegionID++
+	a.cityIDs[key] = id
+	a.cityTargets[id] = cityTarget{country: code, city: slug}
+	return id
+}
+
+// idForGroup returns the id of the submenu that holds a country's cities.
+// Caller holds a.mu. Deliberately not reversible: a parent is not a choice, and
+// a host that reports a click on one gets nothing rather than a guess.
+func (a *app) idForGroup(code string) int32 {
+	code = strings.ToUpper(strings.TrimSpace(code))
+	if id, ok := a.groupIDs[code]; ok {
+		return id
+	}
+	id := a.nextRegionID
+	a.nextRegionID++
+	a.groupIDs[code] = id
+	return id
+}
+
+// cityForID is regionForID's counterpart for city entries.
+func (a *app) cityForID(id int32) (cityTarget, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	t, ok := a.cityTargets[id]
+	return t, ok
 }
 
 // layoutItem is dbusmenu's (ia{sv}av): an id, its properties, and its children
@@ -155,6 +207,8 @@ func (m *menuMethods) Event(id int32, eventID string, data dbus.Variant, timesta
 		// lists — the panel may not have re-read the layout yet.
 		if code, ok := a.regionForID(id); ok {
 			a.doConnect(code)
+		} else if t, ok := a.cityForID(id); ok {
+			a.connectTo(t.country, t.city)
 		}
 	}
 	return nil
@@ -194,18 +248,57 @@ func (m *menuMethods) buildLocked() layoutItem {
 	// daemon last supplied, which is the account's own — the built-in fallback
 	// only until that first answer arrives.
 	sub := layoutItem{ID: idRegion, Properties: submenuProps("Region"), Children: []dbus.Variant{}}
-	for _, r := range a.choices {
-		props := enabled(r.Name, !busy)
+	radio := func(label string, checked bool) map[string]dbus.Variant {
+		props := enabled(label, !busy)
 		props["toggle-type"] = dbus.MakeVariant("radio")
 		state := int32(0)
-		if strings.EqualFold(r.Code, a.country) {
+		if checked {
 			state = 1
 		}
 		props["toggle-state"] = dbus.MakeVariant(state)
-		sub.Children = append(sub.Children, dbus.MakeVariant(layoutItem{
+		return props
+	}
+	for _, r := range a.choices {
+		chosen := strings.EqualFold(r.Code, a.country)
+		cities := citiesOf(a.places, r.Code)
+
+		if len(cities) == 0 {
+			// No cities to choose between, or none known yet: the country is
+			// the whole choice, as it was before cities existed.
+			sub.Children = append(sub.Children, dbus.MakeVariant(layoutItem{
+				ID:         a.idForRegion(r.Code),
+				Properties: radio(r.Name, chosen),
+			}))
+			continue
+		}
+
+		// A country with cities is a submenu, with "Any city" first. That entry
+		// is the country on its own and reuses the country's id, so a click on
+		// it means exactly what a click on the plain entry always meant.
+		//
+		// A submenu parent cannot carry a radio mark of its own, so the chosen
+		// country is marked in its label instead; otherwise the user would have
+		// to open every country to find out which one they were on.
+		label := r.Name
+		if chosen {
+			label += " ✓"
+		}
+		group := layoutItem{
+			ID:         a.idForGroup(r.Code),
+			Properties: submenuProps(label),
+			Children:   []dbus.Variant{},
+		}
+		group.Children = append(group.Children, dbus.MakeVariant(layoutItem{
 			ID:         a.idForRegion(r.Code),
-			Properties: props,
+			Properties: radio("Any city", chosen && a.city == ""),
 		}))
+		for _, c := range cities {
+			group.Children = append(group.Children, dbus.MakeVariant(layoutItem{
+				ID:         a.idForCity(r.Code, c.Slug),
+				Properties: radio(c.Name, chosen && strings.EqualFold(a.city, c.Slug)),
+			}))
+		}
+		sub.Children = append(sub.Children, dbus.MakeVariant(group))
 	}
 	add(sub)
 
@@ -228,6 +321,9 @@ func statusLine(a *app) string {
 		line := "Connected"
 		if a.st.Country != "" {
 			line += " — " + regionName(a.st.Country)
+			if a.st.City != "" {
+				line += " · " + cityName(a.places, a.st.Country, a.st.City)
+			}
 		}
 		if a.st.ExitIP != "" {
 			line += " (" + a.st.ExitIP + ")"

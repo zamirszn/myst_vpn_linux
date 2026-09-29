@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
+
+	"github.com/zamirszn/mysterium-linux-client/desktop/internal/daemonclient"
 )
 
 // fakeClient stands in for the daemon. block, when set, holds a connect open so
@@ -31,10 +33,17 @@ type fakeClient struct {
 	countriesResp []string
 	countriesErr  error
 
+	// locationsResp is the city list. Left nil, the applet has no cities and
+	// every country is a plain entry, which is what most tests want.
+	locationsResp []daemonclient.LocationCountry
+	locationsErr  error
+
 	statusCalls    int
 	connectCalls   int
 	countriesCalls int
+	locationsCalls int
 	lastCountry    string
+	lastCity       string
 
 	block chan struct{}
 }
@@ -46,10 +55,11 @@ func (f *fakeClient) Status(context.Context) (*status, error) {
 	return f.statusResp, f.statusErr
 }
 
-func (f *fakeClient) Connect(_ context.Context, country, _ string) (*status, error) {
+func (f *fakeClient) Connect(_ context.Context, t daemonclient.Target) (*status, error) {
 	f.mu.Lock()
 	f.connectCalls++
-	f.lastCountry = country
+	f.lastCountry = t.Country
+	f.lastCity = t.City
 	block := f.block
 	f.mu.Unlock()
 
@@ -70,6 +80,19 @@ func (f *fakeClient) Countries(context.Context) ([]string, error) {
 	defer f.mu.Unlock()
 	f.countriesCalls++
 	return f.countriesResp, f.countriesErr
+}
+
+func (f *fakeClient) Locations(_ context.Context, ipType string) ([]daemonclient.LocationCountry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.locationsCalls++
+	return f.locationsResp, f.locationsErr
+}
+
+func (f *fakeClient) askedForLocations() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.locationsCalls
 }
 
 func (f *fakeClient) counts() (statusCalls, connectCalls int) {
