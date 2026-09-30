@@ -106,3 +106,24 @@ func TestRegionRowIsCaseInsensitive(t *testing.T) {
 		t.Errorf("regionRow(\"ZZ\") = %d, want 0", got)
 	}
 }
+
+func TestIPTypeRowAndValueRoundTrip(t *testing.T) {
+	// A fresh dropdown reports -1; it must mean residential, the daemon's default.
+	for _, row := range []int{-1, 0, 99} {
+		if got := ipTypeAt(row); got != "residential" {
+			t.Errorf("ipTypeAt(%d) = %q, want residential", row, got)
+		}
+	}
+	if got := ipTypeAt(1); got != "hosting" {
+		t.Errorf("ipTypeAt(1) = %q, want hosting (the API's name for data center)", got)
+	}
+	// The status path: empty means the default pool, case is not significant.
+	for value, want := range map[string]uint{"": 0, "residential": 0, "HOSTING": 1, "unknown": 0} {
+		if got := ipTypeRow(value); got != want {
+			t.Errorf("ipTypeRow(%q) = %d, want %d", value, got, want)
+		}
+	}
+	if got := ipTypeLabel("hosting"); got != "Data center" {
+		t.Errorf("ipTypeLabel(hosting) = %q", got)
+	}
+}

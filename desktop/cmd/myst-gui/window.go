@@ -34,7 +34,7 @@ const fastestLabel = "Fastest (recommended)"
 // the account's own. It names the likely cause, because the likely cause is a
 // daemon older than this window, and that is not something the window can fix
 // by trying harder.
-const fallbackNote = `<span foreground="#888" size="small">Common regions only — ` +
+const fallbackNote = `<span foreground="#a9a7c2" size="small">Common regions only — ` +
 	`the daemon could not list them all. If mystd is up to date, either the ` +
 	`list is still loading or the daemon is not answering.</span>`
 
@@ -43,11 +43,15 @@ type window struct {
 	client daemonclient.Client
 
 	win     *gtk.ApplicationWindow
+	banner  *gtk.Label // the green bar across the top while connected
 	heading *gtk.Label
 	detail  *gtk.Label
 	action  *gtk.Button
+	ipType  *gtk.Notebook
 	region  *gtk.DropDown
 	city    *gtk.DropDown
+	search  *gtk.SearchEntry
+	results *gtk.ListBox
 	note    *gtk.Label
 	exitIP  *gtk.Label
 	copy    *gtk.Button
@@ -92,36 +96,70 @@ type window struct {
 	// Cities are a separate, larger request from the plain country list, so a
 	// daemon too old to serve them costs the window nothing beyond having no
 	// city picker: countries alone keep working exactly as before.
-	places     []regions.Place
-	havePlaces atomic.Bool
+	//
+	// The residential and data centre lists are genuinely different datasets
+	// (106 countries against 49), so each is fetched and kept separately.
+	// places is the one for the type currently selected; placesByType holds
+	// every list fetched so far. Only the main loop touches these.
+	places       []regions.Place
+	placesByType map[string][]regions.Place
 
-	// loadingPlaces keeps one locations request in flight at a time, for the
-	// same reason loadingCountries does.
-	loadingPlaces atomic.Bool
+	// loadingPlaces keeps one locations request in flight per type, for the
+	// same reason loadingCountries does. Only the main loop touches it.
+	loadingPlaces map[string]bool
 
 	// cityChoice is the picked city's slug, remembered across a country change
 	// so switching country and back does not lose it. Only the main loop
 	// touches it.
 	cityChoice string
+
+	// ipTypeIdx is the selected IP type tab. Only the main loop touches it.
+	ipTypeIdx int
+
+	// matches are the rows currently in the search results list, in row order.
+	// Only the main loop touches it.
+	matches []regions.CityMatch
 }
 
+// searchLimit caps the results list so it stays a short menu under the entry
+// rather than growing the window.
+const searchLimit = 6
+
 func newWindow(app *gtk.Application, client daemonclient.Client) *window {
-	w := &window{app: app, client: client}
+	w := &window{
+		app:           app,
+		client:        client,
+		placesByType:  map[string][]regions.Place{},
+		loadingPlaces: map[string]bool{},
+	}
+
+	// The stylesheet is installed per display, once the display exists — which
+	// it does by the time the activate handler runs.
+	loadStyle()
 
 	w.win = gtk.NewApplicationWindow(app)
 	w.win.SetTitle("Mysterium VPN")
-	w.win.SetDefaultSize(400, 300)
+	// A tall, narrow column, like the official app's location panel.
+	w.win.SetDefaultSize(420, 720)
+
+	// Hidden until there is a tunnel (or one is being built) to report.
+	w.banner = gtk.NewLabel("")
+	w.banner.AddCSSClass("connected-banner")
+	w.banner.SetVisible(false)
 
 	w.heading = gtk.NewLabel("…")
 	w.heading.SetMarkup("<b>Checking…</b>")
 	w.heading.SetHAlign(gtk.AlignStart)
+	w.heading.AddCSSClass("status-heading")
 
 	w.detail = gtk.NewLabel("")
 	w.detail.SetWrap(true)
 	w.detail.SetHAlign(gtk.AlignStart)
 	w.detail.SetSelectable(true)
+	w.detail.AddCSSClass("status-detail")
 
 	w.action = gtk.NewButtonWithLabel("Connect")
+	w.action.AddCSSClass("connect-btn")
 	w.action.ConnectClicked(func() { w.toggle() })
 
 	// Entry 0 is "Fastest" and the regions follow it. Without that leading
@@ -134,6 +172,23 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	// rather than waiting on the daemon; the real list, which is the account's
 	// own and about five times longer, replaces it as soon as it arrives.
 	w.choices = regions.All
+
+	// Which pool of IPs to exit through, as tabs. The pages are empty: the
+	// pickers below are shared, and switching tab swaps their lists for that
+	// pool's own.
+	w.ipType = gtk.NewNotebook()
+	w.ipType.SetShowBorder(false)
+	for _, label := range ipTypeLabels() {
+		w.ipType.AppendPage(gtk.NewBox(gtk.OrientationVertical, 0), gtk.NewLabel(label))
+	}
+	// Connected after the pages exist so adding them does not fire it. The
+	// signal runs before the notebook's own current page changes, so the row
+	// is taken from its argument and kept in ipTypeIdx rather than read back.
+	w.ipType.ConnectSwitchPage(func(_ gtk.Widgetter, page uint) {
+		w.ipTypeIdx = int(page)
+		w.onIPTypeChanged()
+	})
+
 	w.region = gtk.NewDropDownFromStrings(w.pickerLabels())
 	w.region.NotifyProperty("selected", func() {
 		w.refreshCityPicker()
@@ -148,6 +203,26 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 		w.cityChoice = regions.CitySlugAt(cities, int(w.city.Selected()))
 	})
 
+	// Search across every country's cities. Picking a hit sets both dropdowns,
+	// so the connect path is unchanged: it still reads them.
+	w.search = gtk.NewSearchEntry()
+	w.search.SetObjectProperty("placeholder-text", "Search for locations")
+	w.search.SetSensitive(false) // until the daemon's city list arrives
+	w.search.ConnectSearchChanged(func() { w.showSearchResults() })
+
+	w.results = gtk.NewListBox()
+	w.results.SetSelectionMode(gtk.SelectionNone)
+	w.results.SetActivateOnSingleClick(true)
+	w.results.AddCSSClass("results")
+	w.results.SetVisible(false)
+	w.results.ConnectRowActivated(func(row *gtk.ListBoxRow) {
+		i := row.Index()
+		if i < 0 || i >= len(w.matches) {
+			return
+		}
+		w.pickSearchResult(w.matches[i])
+	})
+
 	// Says so when the picker is on the built-in fallback rather than the
 	// account's real list. Without it the two are indistinguishable, and a
 	// daemon too old to answer "countries" — which is exactly what an
@@ -159,24 +234,71 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	w.note.SetMarkup(fallbackNote)
 
 	w.copy = gtk.NewButtonWithLabel("Copy")
+	w.copy.AddCSSClass("chip")
 	w.copy.ConnectClicked(func() { w.copyExitIP() })
 
-	body := gtk.NewBox(gtk.OrientationVertical, 18)
-	body.SetMarginTop(18)
-	body.SetMarginBottom(18)
-	body.SetMarginStart(18)
-	body.SetMarginEnd(18)
+	// Brand bar: the wordmark, weighted the way the official logo is — heavy
+	// MYSTERIUM, light VPN.
+	brand := gtk.NewLabel("")
+	brand.SetMarkup(`<span weight="heavy">MYSTERIUM</span><span weight="light">VPN</span>`)
+	brand.AddCSSClass("brand")
+	brand.SetHAlign(gtk.AlignStart)
+	brand.SetMarginTop(18)
+	brand.SetMarginBottom(6)
+	brand.SetMarginStart(20)
+	brand.SetMarginEnd(20)
 
-	body.Append(w.heading)
-	body.Append(w.detail)
-	body.Append(w.action)
+	// The status and the one button that acts on it share a card, so the
+	// button reads as belonging to the state above it.
+	statusCard := gtk.NewBox(gtk.OrientationVertical, 6)
+	statusCard.AddCSSClass("card")
+	statusCard.Append(w.heading)
+	statusCard.Append(w.detail)
+	statusCard.Append(w.action)
+
+	// Everything that chooses where to connect goes under one title.
+	locationTitle := gtk.NewLabel("Select location")
+	locationTitle.AddCSSClass("section-title")
+	locationTitle.SetHAlign(gtk.AlignStart)
+
+	detailsTitle := gtk.NewLabel("Connection details")
+	detailsTitle.AddCSSClass("section-title")
+	detailsTitle.SetHAlign(gtk.AlignStart)
+
+	detailsCard := gtk.NewBox(gtk.OrientationVertical, 0)
+	detailsCard.AddCSSClass("card")
+	detailsCard.Append(w.details())
+
+	body := gtk.NewBox(gtk.OrientationVertical, 12)
+	body.SetMarginTop(8)
+	body.SetMarginBottom(20)
+	body.SetMarginStart(20)
+	body.SetMarginEnd(20)
+
+	body.Append(statusCard)
+	body.Append(locationTitle)
+	body.Append(w.search)
+	body.Append(w.results)
+	body.Append(w.ipType)
 	body.Append(w.region)
 	body.Append(w.city)
 	body.Append(w.note)
-	body.Append(gtk.NewSeparator(gtk.OrientationHorizontal))
-	body.Append(w.details())
+	body.Append(detailsTitle)
+	body.Append(detailsCard)
 
-	w.win.SetChild(body)
+	// Scrolls rather than growing the window, so a short screen can still
+	// reach the details card.
+	scroller := gtk.NewScrolledWindow()
+	scroller.SetPolicy(gtk.PolicyNever, gtk.PolicyAutomatic)
+	scroller.SetVExpand(true)
+	scroller.SetChild(body)
+
+	root := gtk.NewBox(gtk.OrientationVertical, 0)
+	root.Append(w.banner)
+	root.Append(brand)
+	root.Append(scroller)
+
+	w.win.SetChild(root)
 
 	// Ask immediately so the window opens on the real state rather than a
 	// placeholder, then keep asking.
@@ -216,7 +338,8 @@ func (w *window) details() *gtk.Widget {
 		key := gtk.NewLabel(row.key)
 		key.SetHAlign(gtk.AlignStart)
 		// Muted, so the values carry the eye.
-		key.SetMarkup(fmt.Sprintf("<span foreground=\"#888\">%s</span>", row.key))
+		key.AddCSSClass("muted-key")
+		key.SetText(row.key)
 
 		row.value.SetHAlign(gtk.AlignStart)
 		row.value.SetSelectable(true)
@@ -234,6 +357,36 @@ func (w *window) details() *gtk.Widget {
 }
 
 func (w *window) present() { w.win.Present() }
+
+// setBanner shows the bar across the top with text, or hides it when text is
+// empty. pending turns it amber, for a tunnel that is on its way up or being
+// repaired rather than up.
+func (w *window) setBanner(text string, pending bool) {
+	if text == "" {
+		w.banner.SetVisible(false)
+		return
+	}
+	w.banner.SetText(text)
+	if pending {
+		w.banner.AddCSSClass("connecting")
+	} else {
+		w.banner.RemoveCSSClass("connecting")
+	}
+	w.banner.SetVisible(true)
+}
+
+// styleAction gives the one button its look for the state it is in: the accent
+// colour for Connect, a quiet grey for Disconnect — so the destructive action
+// is never the most inviting thing in the window.
+func (w *window) styleAction(connected bool) {
+	if connected {
+		w.action.RemoveCSSClass("connect-btn")
+		w.action.AddCSSClass("disconnect-btn")
+		return
+	}
+	w.action.RemoveCSSClass("disconnect-btn")
+	w.action.AddCSSClass("connect-btn")
+}
 
 // onMain runs f on the GTK main loop. Every widget touch has to go through
 // this: the socket calls run on their own goroutines, and GTK is not
@@ -290,7 +443,11 @@ func (w *window) toggle() {
 	}
 	w.cityChoice = w.selectedCity()
 	w.run(func(ctx context.Context) (*daemonclient.Status, error) {
-		return w.client.Connect(ctx, daemonclient.Target{Country: w.selectedRegion(), City: w.cityChoice})
+		return w.client.Connect(ctx, daemonclient.Target{
+			Country: w.selectedRegion(),
+			City:    w.cityChoice,
+			IPType:  w.selectedIPType(),
+		})
 	})
 }
 
@@ -327,6 +484,13 @@ func (w *window) selectedCity() string {
 // cityChoice on a country change; it just stops matching anything until the
 // user, or a synced connected status, sets it to one that does.
 func (w *window) refreshCityPicker() {
+	// SetModel resets the dropdown's row, which fires its notify handler and
+	// overwrites cityChoice with "Any city". Take the wanted choice first and
+	// put it back afterwards, so a choice made programmatically (a search hit)
+	// survives the rebuild.
+	want := w.cityChoice
+	defer func() { w.cityChoice = want }()
+
 	cities := regions.CitiesOf(w.places, w.selectedRegion())
 	if len(cities) == 0 {
 		w.city.SetModel(gtk.NewStringList([]string{"Any city"}))
@@ -338,7 +502,7 @@ func (w *window) refreshCityPicker() {
 		labels = append(labels, c.Name)
 	}
 	w.city.SetModel(gtk.NewStringList(labels))
-	w.city.SetSelected(regions.CityRow(cities, w.cityChoice))
+	w.city.SetSelected(regions.CityRow(cities, want))
 }
 
 // pickerEnabled is whether the region and city dropdowns may be used: while an
@@ -353,52 +517,185 @@ func (w *window) pickerEnabled() bool {
 // touches the model or the selection, only whether the control can be used.
 func (w *window) applyCitySensitivity() {
 	w.city.SetSensitive(w.pickerEnabled() && len(regions.CitiesOf(w.places, w.selectedRegion())) > 0)
+
+	w.ipType.SetSensitive(w.pickerEnabled())
+
+	// Search follows the same rule as the pickers it drives, and needs the city
+	// list to have arrived. When it goes inactive, drop any open results.
+	searchable := w.pickerEnabled() && len(w.places) > 0
+	w.search.SetSensitive(searchable)
+	if !searchable && w.results.IsVisible() {
+		w.clearSearch()
+	}
 }
 
-// loadPlaces pulls the account's country/city data from the daemon. It mirrors
-// loadCountries in every respect: off the main loop, one attempt at a time,
-// asked for only until it succeeds, and silent on failure — the countries
-// picker already works without it.
-func (w *window) loadPlaces() {
-	if w.havePlaces.Load() {
-		return
+// showSearchResults rebuilds the results list for the entry's current text.
+func (w *window) showSearchResults() {
+	for {
+		row := w.results.RowAtIndex(0)
+		if row == nil {
+			break
+		}
+		w.results.Remove(row)
 	}
-	if !w.loadingPlaces.CompareAndSwap(false, true) {
-		return
-	}
-	go func() {
-		defer w.loadingPlaces.Store(false)
+	w.matches = regions.SearchCities(w.places, w.search.Text(), searchLimit)
 
+	for _, m := range w.matches {
+		label := gtk.NewLabel(m.Label())
+		label.SetHAlign(gtk.AlignStart)
+		label.SetMarginTop(6)
+		label.SetMarginBottom(6)
+		label.SetMarginStart(10)
+		label.SetMarginEnd(10)
+		w.results.Append(label)
+	}
+	w.results.SetVisible(len(w.matches) > 0)
+}
+
+// clearSearch empties the entry and hides the results.
+func (w *window) clearSearch() {
+	w.search.SetText("") // fires search-changed, which empties the list
+	w.matches = nil
+	w.results.SetVisible(false)
+}
+
+// pickSearchResult selects a hit's country and city in the dropdowns.
+func (w *window) pickSearchResult(m regions.CityMatch) {
+	row := regionRow(w.choices, m.Code)
+	if row == 0 {
+		return // the country is not in the picker's list; do not guess
+	}
+	w.cityChoice = m.Slug
+	w.region.SetSelected(row) // if the row changes, its handler rebuilds the cities
+	w.refreshCityPicker()     // and if it did not, this does
+	w.applyCitySensitivity()
+	w.clearSearch()
+}
+
+// loadPlaces pulls the country/city data for the selected IP type from the
+// daemon. It mirrors loadCountries in every respect: off the main loop, one
+// attempt at a time per type, asked for only until it succeeds, and silent on
+// failure — the countries picker already works without it.
+func (w *window) loadPlaces() {
+	t := w.selectedIPType()
+	if _, ok := w.placesByType[t]; ok || w.loadingPlaces[t] {
+		return
+	}
+	w.loadingPlaces[t] = true
+
+	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 
-		locs, err := w.client.Locations(ctx, "")
+		var list []regions.Place
+		locs, err := w.client.Locations(ctx, t)
 		if err != nil || len(locs) == 0 {
-			log.Printf("locations: countries=%d err=%v", len(locs), err)
-			return
-		}
-		log.Printf("locations: got %d countries", len(locs))
-		raw := make([]regions.RawCountry, 0, len(locs))
-		for _, c := range locs {
-			rc := regions.RawCountry{Code: c.Code, Name: c.Name}
-			for _, ct := range c.Cities {
-				rc.Cities = append(rc.Cities, regions.RawCity{Slug: ct.Slug, Name: ct.Name})
+			log.Printf("locations(%s): countries=%d err=%v", t, len(locs), err)
+		} else {
+			log.Printf("locations(%s): got %d countries", t, len(locs))
+			raw := make([]regions.RawCountry, 0, len(locs))
+			for _, c := range locs {
+				rc := regions.RawCountry{Code: c.Code, Name: c.Name}
+				for _, ct := range c.Cities {
+					rc.Cities = append(rc.Cities, regions.RawCity{Slug: ct.Slug, Name: ct.Name})
+				}
+				raw = append(raw, rc)
 			}
-			raw = append(raw, rc)
+			list = regions.FromLocations(raw)
 		}
-		list := regions.FromLocations(raw)
-		if len(list) == 0 {
-			return
-		}
+
 		w.onMain(func() {
-			if w.havePlaces.Swap(true) {
-				return // a slower earlier request beat us to it
+			delete(w.loadingPlaces, t)
+			if len(list) == 0 {
+				return
 			}
-			w.places = list
-			w.refreshCityPicker() // the current country may now have cities
-			w.applyCitySensitivity()
+			w.placesByType[t] = list
+			if w.selectedIPType() != t {
+				return // the user moved on; it is cached for when they return
+			}
+			w.showPlaces(list)
 		})
 	}()
+}
+
+// showPlaces makes a type's list the one on screen: its countries fill the
+// region picker and its cities the city picker.
+func (w *window) showPlaces(list []regions.Place) {
+	w.places = list
+	w.fillRegions(regions.Regions(list))
+	w.refreshCityPicker()
+	w.applyCitySensitivity()
+}
+
+// onIPTypeChanged swaps the country and city lists for the newly selected
+// type, using the cached list if there is one and fetching it if not.
+func (w *window) onIPTypeChanged() {
+	w.clearSearch()
+	if list, ok := w.placesByType[w.selectedIPType()]; ok {
+		w.showPlaces(list)
+		return
+	}
+	// Not fetched yet: no cities (and no search) until it arrives. The country
+	// list stays as it is meanwhile rather than emptying the picker.
+	w.places = nil
+	w.refreshCityPicker()
+	w.applyCitySensitivity()
+	w.loadPlaces()
+}
+
+// selectedIPType is the API value of the IP type picker.
+func (w *window) selectedIPType() string { return ipTypeAt(w.ipTypeIdx) }
+
+// selectIPType moves the picker to a type reported by the daemon's status, so a
+// connected window shows the pool actually in use.
+func (w *window) selectIPType(value string) {
+	if row := int(ipTypeRow(value)); row != w.ipTypeIdx {
+		w.ipType.SetCurrentPage(row) // fires the switch-page handler
+	}
+}
+
+// ipTypes are the tabs. Values are what the API takes: it calls the
+// data centre pool "hosting".
+var ipTypes = []struct{ Value, Label string }{
+	{"residential", "Residential"},
+	{"hosting", "Data center"},
+}
+
+func ipTypeLabels() []string {
+	out := make([]string, len(ipTypes))
+	for i, t := range ipTypes {
+		out[i] = t.Label
+	}
+	return out
+}
+
+// ipTypeAt maps a tab index to an API value, and ipTypeRow does the reverse.
+// A fresh dropdown reports -1 and an unknown or empty type (which the daemon
+// treats as residential) maps to row 0, so neither can select the wrong pool.
+func ipTypeAt(row int) string {
+	if row < 0 || row >= len(ipTypes) {
+		return ipTypes[0].Value
+	}
+	return ipTypes[row].Value
+}
+
+func ipTypeRow(value string) uint {
+	for i, t := range ipTypes {
+		if strings.EqualFold(t.Value, value) {
+			return uint(i)
+		}
+	}
+	return 0
+}
+
+// ipTypeLabel is a type's readable name for the status line.
+func ipTypeLabel(value string) string {
+	for _, t := range ipTypes {
+		if strings.EqualFold(t.Value, value) {
+			return t.Label
+		}
+	}
+	return value
 }
 
 // fillRegions replaces the picker's contents with a country list, keeping the
@@ -512,16 +809,21 @@ func (w *window) apply(st daemonclient.Status) {
 	case daemonclient.StateConnected:
 		w.heading.SetMarkup("<b>Connected</b>")
 		w.detail.SetText(w.regionLine(st))
+		w.setBanner("Connected", false)
 	case daemonclient.StateConnecting:
 		w.heading.SetMarkup("<b>Connecting…</b>")
 		w.detail.SetText("Bringing the tunnel up. This can take a moment.")
+		w.setBanner("Connecting…", true)
 	case daemonclient.StateReconnecting:
 		w.heading.SetMarkup("<b>Reconnecting…</b>")
 		w.detail.SetText(w.reconnectLine(st))
+		w.setBanner("Reconnecting…", true)
 	default:
 		w.heading.SetMarkup("<b>Not connected</b>")
 		w.detail.SetText(w.idleLine(st))
+		w.setBanner("", false)
 	}
+	w.styleAction(st.State == daemonclient.StateConnected)
 
 	// The button follows the state, except while an operation of ours is in
 	// flight and the daemon has not caught up yet.
@@ -556,6 +858,9 @@ func (w *window) apply(st daemonclient.Status) {
 		// from whatever cityChoice already holds — so it has to be the
 		// connected city by that point, not the choice from before connecting.
 		w.cityChoice = st.City
+		// The type first: changing it swaps the country list the next line
+		// selects within.
+		w.selectIPType(st.IPType)
 		w.selectRegion(st.Country)
 	}
 	w.applyCitySensitivity()
@@ -606,6 +911,9 @@ func (w *window) loadCountries() {
 			if w.haveCountries.Swap(true) {
 				return // a slower earlier request beat us to it
 			}
+			if len(w.places) > 0 {
+				return // the selected type's own list is already on screen
+			}
 			w.fillRegions(list)
 		})
 	}()
@@ -616,6 +924,8 @@ func (w *window) loadCountries() {
 func (w *window) showUnreachable(err error) {
 	w.action.SetSensitive(true)
 	w.action.SetLabel("Connect")
+	w.styleAction(false)
+	w.setBanner("", false)
 	w.heading.SetMarkup("<b>Cannot reach the daemon</b>")
 	w.detail.SetText(fmt.Sprintf("%v\n\nIs mystd running?  systemctl status mystd", err))
 	w.exitIP.SetText("—")
@@ -650,7 +960,7 @@ func (w *window) regionLine(st daemonclient.Status) string {
 		name += " · " + regions.CityName(w.places, st.Country, st.City)
 	}
 	if st.IPType != "" {
-		name += " · " + st.IPType
+		name += " · " + ipTypeLabel(st.IPType)
 	}
 	return name
 }

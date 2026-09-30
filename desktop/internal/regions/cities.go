@@ -149,3 +149,78 @@ func CityRow(cities []City, slug string) uint {
 	}
 	return 0
 }
+
+// CityMatch is one search hit: a city together with the country it is in, which
+// is what the front end needs to select both pickers at once.
+type CityMatch struct {
+	Code    string // country code, upper-case
+	Country string // country display name
+	City
+}
+
+// Label is how a hit reads in a results list. The country is part of it because
+// city names repeat across countries (there is more than one Birmingham).
+func (m CityMatch) Label() string { return m.Name + " · " + m.Country }
+
+// SearchCities finds cities across every country whose name or slug contains
+// query, case-insensitively. Names that start with the query come first, then
+// the rest, each group alphabetical by city and then country, so the result is
+// stable between keystrokes. limit <= 0 means no limit.
+//
+// A blank query returns nil rather than every city: an empty search box should
+// show nothing, not the whole list.
+func SearchCities(places []Place, query string, limit int) []CityMatch {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return nil
+	}
+	type hit struct {
+		m      CityMatch
+		prefix bool
+	}
+	var hits []hit
+	for _, p := range places {
+		for _, c := range p.Cities {
+			name := strings.ToLower(c.Name)
+			slug := strings.ToLower(c.Slug)
+			if !strings.Contains(name, q) && !strings.Contains(slug, q) {
+				continue
+			}
+			hits = append(hits, hit{
+				m:      CityMatch{Code: p.Code, Country: p.Name, City: c},
+				prefix: strings.HasPrefix(name, q) || strings.HasPrefix(slug, q),
+			})
+		}
+	}
+	sort.SliceStable(hits, func(i, j int) bool {
+		a, b := hits[i], hits[j]
+		if a.prefix != b.prefix {
+			return a.prefix
+		}
+		if a.m.Name != b.m.Name {
+			return a.m.Name < b.m.Name
+		}
+		return a.m.Country < b.m.Country
+	})
+	if limit > 0 && len(hits) > limit {
+		hits = hits[:limit]
+	}
+	out := make([]CityMatch, len(hits))
+	for i, h := range hits {
+		out[i] = h.m
+	}
+	return out
+}
+
+// Regions is the plain country list of a set of places, in the same order, for
+// a country picker that should offer exactly the countries a dataset has.
+func Regions(places []Place) []Region {
+	if len(places) == 0 {
+		return nil
+	}
+	out := make([]Region, len(places))
+	for i, p := range places {
+		out[i] = p.Region
+	}
+	return out
+}

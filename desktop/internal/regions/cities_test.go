@@ -120,3 +120,52 @@ func TestCityRowAndSlugRoundTrip(t *testing.T) {
 		t.Errorf("CityRow is case-insensitive for the status path, got %d", got)
 	}
 }
+
+func TestSearchCities(t *testing.T) {
+	places := FromLocations([]RawCountry{
+		{Code: "GB", Name: "United Kingdom", Cities: []RawCity{
+			{Slug: "birmingham", Name: "Birmingham"},
+			{Slug: "london", Name: "London"},
+			{Slug: "new-london", Name: "New London"},
+		}},
+		{Code: "US", Name: "United States", Cities: []RawCity{
+			{Slug: "birmingham", Name: "Birmingham"},
+		}},
+	})
+
+	if got := SearchCities(places, "   ", 0); got != nil {
+		t.Errorf("blank query = %v, want nil", got)
+	}
+	if got := SearchCities(places, "zzz", 0); len(got) != 0 {
+		t.Errorf("no match = %v, want none", got)
+	}
+
+	// Same city name in two countries: both come back, told apart by country.
+	got := SearchCities(places, "BIRM", 0)
+	if len(got) != 2 || got[0].Code != "GB" || got[1].Code != "US" {
+		t.Fatalf("birm = %+v, want GB then US", got)
+	}
+	if got[0].Label() != "Birmingham · United Kingdom" {
+		t.Errorf("label = %q", got[0].Label())
+	}
+
+	// Prefix matches outrank substring matches.
+	got = SearchCities(places, "london", 0)
+	if len(got) != 2 || got[0].Slug != "london" || got[1].Slug != "new-london" {
+		t.Errorf("london = %+v, want London before New London", got)
+	}
+
+	if got := SearchCities(places, "o", 1); len(got) != 1 {
+		t.Errorf("limit 1 returned %d", len(got))
+	}
+}
+
+func TestRegions(t *testing.T) {
+	if Regions(nil) != nil {
+		t.Error("no places must give a nil list")
+	}
+	got := Regions(FromLocations(sample()))
+	if len(got) != 3 || got[0].Code != "GB" || got[1].Code != "US" {
+		t.Errorf("Regions = %+v, want the places' countries in order", got)
+	}
+}
