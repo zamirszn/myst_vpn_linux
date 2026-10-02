@@ -1,0 +1,26 @@
+[Unit]
+Description=Mysterium VPN daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mystd -socket-group myst
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+ReadWritePaths=/etc/wireguard /etc/resolv.conf /var/lib/mystd /run/mystd
+StateDirectory=mystd
+RuntimeDirectory=mystd
+
+[Install]
+WantedBy=multi-user.target

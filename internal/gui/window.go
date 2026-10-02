@@ -331,14 +331,14 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	scroller.SetVExpand(true)
 	scroller.SetChild(body)
 
-	// Which of the two is showing is the daemon's call, made in apply. It opens
-	// on the main screen so a daemon too old to say anything about accounts is
-	// never greeted with a login form.
+	// Start on the login form until the daemon confirms that an account is
+	// available. This prevents a signed-out user from briefly seeing the VPN
+	// screen with no login controls while the first status request is pending.
 	w.screens = gtk.NewStack()
 	w.screens.SetVExpand(true)
 	w.screens.AddNamed(scroller, "main")
 	w.screens.AddNamed(w.buildLogin(), "login")
-	w.screens.SetVisibleChildName("main")
+	w.screens.SetVisibleChildName("login")
 
 	root := gtk.NewBox(gtk.OrientationVertical, 0)
 	root.Append(w.banner)
@@ -1015,6 +1015,9 @@ func (w *window) loadCountries() {
 // showUnreachable is for a daemon that did not answer at all, which is a
 // different problem from a daemon that answered with a failure.
 func (w *window) showUnreachable(err error) {
+	w.screens.SetVisibleChildName("login")
+	w.accountBar.SetVisible(false)
+	w.loginFail(w.login.emailErr, "Cannot reach the Mysterium daemon. Start or update mystd, then try again. "+err.Error())
 	w.action.SetSensitive(true)
 	w.action.SetLabel("Connect")
 	w.styleAction(false)

@@ -332,13 +332,13 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	scroller.SetChild(body)
 
 	// Which of the two is showing is the daemon's call, made in apply. It opens
-	// on the main screen so a daemon too old to say anything about accounts is
-	// never greeted with a login form.
+	// on the login screen while the first status request is pending. A current
+	// daemon switches to the correct screen as soon as its status arrives.
 	w.screens = gtk.NewStack()
 	w.screens.SetVExpand(true)
 	w.screens.AddNamed(scroller, "main")
 	w.screens.AddNamed(w.buildLogin(), "login")
-	w.screens.SetVisibleChildName("main")
+	w.screens.SetVisibleChildName("login")
 
 	root := gtk.NewBox(gtk.OrientationVertical, 0)
 	root.Append(w.banner)
@@ -462,6 +462,11 @@ func (w *window) poll() {
 		w.onMain(func() {
 			if err != nil {
 				w.showUnreachable(err)
+				// Keep the login form visible while the daemon is unavailable,
+				// and explain why requesting a link cannot work yet.
+				w.screens.SetVisibleChildName("login")
+				w.accountBar.SetVisible(false)
+				w.loginFail(w.login.emailErr, "Cannot reach the Mysterium daemon. Start or update mystd, then try again. "+err.Error())
 				return
 			}
 			if w.generation.Load() != gen {

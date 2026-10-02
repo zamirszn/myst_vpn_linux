@@ -5,17 +5,15 @@ import (
 	"testing"
 )
 
-// TestOnlyAnExplicitNoIsSignedOut is the whole reason LoggedIn is a pointer.
-// A daemon built before accounts existed sends no such field, and treating its
-// silence as "signed out" would cover a perfectly working client with a login
-// screen the moment the window was upgraded ahead of the daemon.
-func TestOnlyAnExplicitNoIsSignedOut(t *testing.T) {
+// TestSignedOutIncludesUnknownAccountState ensures an older daemon cannot leave
+// the GUI on the VPN screen while hiding login/logout controls.
+func TestSignedOutIncludesUnknownAccountState(t *testing.T) {
 	cases := []struct {
 		name string
 		wire string
 		want bool
 	}{
-		{"an older daemon that does not say", `{"state":"disconnected"}`, false},
+		{"an older daemon that does not report account state", `{"state":"disconnected"}`, true},
 		{"signed in", `{"state":"disconnected","logged_in":true,"account":"a@b.co"}`, false},
 		{"signed out", `{"state":"disconnected","logged_in":false}`, true},
 	}

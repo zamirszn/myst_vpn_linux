@@ -111,9 +111,11 @@ type Status struct {
 	Account string `json:"account,omitempty"`
 }
 
-// SignedOut reports whether the daemon said, in so many words, that it holds no
-// credentials. False for an unknown answer: only a definite "no" counts.
-func (s Status) SignedOut() bool { return s.LoggedIn != nil && !*s.LoggedIn }
+// SignedOut reports whether the daemon confirms an account is not available.
+// A missing logged_in field means the daemon is too old to report account state;
+// require an updated daemon rather than silently showing the VPN screen without
+// login/logout controls.
+func (s Status) SignedOut() bool { return s.LoggedIn == nil || !*s.LoggedIn }
 
 // Client sends requests to the daemon. The zero value talks to the default
 // socket.
