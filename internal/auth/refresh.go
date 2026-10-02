@@ -90,6 +90,11 @@ func (e *Exchanger) Refresh(ctx context.Context, current *Token) (*Token, error)
 	if out.TokenType == "" {
 		out.TokenType = current.TokenType
 	}
+	// The response never names the account, so without this a refresh — which
+	// happens silently, about monthly — would erase who is signed in.
+	if out.Email == "" {
+		out.Email = current.Email
+	}
 	out.ObtainedAt = time.Now()
 	return &out, nil
 }

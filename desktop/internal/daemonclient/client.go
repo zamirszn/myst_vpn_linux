@@ -44,6 +44,10 @@ type request struct {
 	Country string `json:"country,omitempty"`
 	City    string `json:"city,omitempty"`
 	IPType  string `json:"ip_type,omitempty"`
+
+	// Email and Code carry the two halves of the magic-link login.
+	Email string `json:"email,omitempty"`
+	Code  string `json:"code,omitempty"`
 }
 
 type response struct {
@@ -94,7 +98,22 @@ type Status struct {
 	KillSwitch bool      `json:"kill_switch"`
 	WakeLock   bool      `json:"wake_lock"`
 	LastError  string    `json:"last_error,omitempty"`
+
+	// LoggedIn is a pointer so that a daemon which does not send the field is
+	// told apart from one that says false. Absent means "unknown", and a front
+	// end must then behave as it did before accounts existed rather than put a
+	// login screen over a daemon that is merely older than the window — the
+	// stale-daemon trap the README warns about, in a more alarming costume.
+	LoggedIn *bool `json:"logged_in,omitempty"`
+
+	// Account is the email the daemon's credentials were issued for. Empty for
+	// credentials imported from a file, which carry no address.
+	Account string `json:"account,omitempty"`
 }
+
+// SignedOut reports whether the daemon said, in so many words, that it holds no
+// credentials. False for an unknown answer: only a definite "no" counts.
+func (s Status) SignedOut() bool { return s.LoggedIn != nil && !*s.LoggedIn }
 
 // Client sends requests to the daemon. The zero value talks to the default
 // socket.
@@ -206,4 +225,25 @@ func (c Client) Locations(ctx context.Context, ipType string) ([]LocationCountry
 		return nil, err
 	}
 	return resp.Locations, nil
+}
+
+// LoginStart asks the daemon to email a login link to the address.
+//
+// The daemon keeps the secret that makes the link redeemable, so the second
+// half, LoginFinish, must reach the same daemon process. Nothing here holds a
+// credential, before or after.
+func (c Client) LoginStart(ctx context.Context, email string) (*Status, error) {
+	return c.Call(ctx, request{Command: "login-start", Email: email})
+}
+
+// LoginFinish hands the daemon what the person pasted from the email — the
+// whole link, or the code in it. The daemon does the parsing, so every front
+// end accepts the same shapes.
+func (c Client) LoginFinish(ctx context.Context, pasted string) (*Status, error) {
+	return c.Call(ctx, request{Command: "login-finish", Code: pasted})
+}
+
+// Logout tells the daemon to close any tunnel and delete its credentials.
+func (c Client) Logout(ctx context.Context) (*Status, error) {
+	return c.Call(ctx, request{Command: "logout"})
 }

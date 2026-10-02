@@ -26,6 +26,14 @@ type stubHandler struct {
 
 	credentials []byte
 	loggedOut   bool
+
+	// The magic-link login, and the account the stub claims to hold.
+	startedFor  string
+	startErr    error
+	pasted      string
+	finishErr   error
+	signedIn    bool
+	accountName string
 }
 
 func (h *stubHandler) Connect(_ context.Context, t Target) (*Status, error) {
@@ -71,8 +79,30 @@ func (h *stubHandler) Login(_ context.Context, credentials []byte) (*Status, err
 
 func (h *stubHandler) Logout(context.Context) (*Status, error) {
 	h.loggedOut = true
+	h.signedIn = false
+	h.accountName = ""
 	return &Status{State: StateDisconnected}, nil
 }
+
+func (h *stubHandler) LoginStart(_ context.Context, email string) (*Status, error) {
+	h.startedFor = email
+	if h.startErr != nil {
+		return nil, h.startErr
+	}
+	return &Status{State: StateDisconnected}, nil
+}
+
+func (h *stubHandler) LoginFinish(_ context.Context, pasted string) (*Status, error) {
+	h.pasted = pasted
+	if h.finishErr != nil {
+		return nil, h.finishErr
+	}
+	h.signedIn = true
+	h.accountName = h.startedFor
+	return &Status{State: StateDisconnected}, nil
+}
+
+func (h *stubHandler) Account() (bool, string) { return h.signedIn, h.accountName }
 
 // serve starts a server on a temporary socket and returns a client for it.
 func serve(t *testing.T, h Handler) Client {
@@ -364,5 +394,92 @@ func TestStatusIsUnaffectedByTheNewField(t *testing.T) {
 	}
 	if st.State != StateDisconnected {
 		t.Errorf("State = %q, want %q", st.State, StateDisconnected)
+	}
+}
+
+// TestMagicLinkLoginRoundTrip walks both halves over the socket and checks that
+// what the person typed reaches the handler untouched. The link is a long URL
+// and the handler does the parsing, so a front end that trimmed or rewrote it
+// on the way would quietly make every login fail.
+func TestMagicLinkLoginRoundTrip(t *testing.T) {
+	h := &stubHandler{}
+	c := serve(t, h)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := c.LoginStart(ctx, "someone@example.com"); err != nil {
+		t.Fatalf("LoginStart: %v", err)
+	}
+	if h.startedFor != "someone@example.com" {
+		t.Errorf("handler was asked to mail %q, want someone@example.com", h.startedFor)
+	}
+
+	link := "https://app.mysteriumvpn.com/login?code=" + strings.Repeat("c", 400) + "&x=1"
+	st, err := c.LoginFinish(ctx, link)
+	if err != nil {
+		t.Fatalf("LoginFinish: %v", err)
+	}
+	if h.pasted != link {
+		t.Errorf("the pasted link arrived changed: %d bytes in, %d bytes out", len(link), len(h.pasted))
+	}
+	if !st.LoggedIn || st.Account != "someone@example.com" {
+		t.Errorf("status after login = logged_in %v account %q, want true and the address", st.LoggedIn, st.Account)
+	}
+}
+
+// TestFailedLoginStepsReachTheCaller keeps the reason a login failed intact. The
+// window shows these words to a person who is trying to work out whether to
+// check their spelling or ask for another email.
+func TestFailedLoginStepsReachTheCaller(t *testing.T) {
+	h := &stubHandler{
+		startErr:  errors.New("the API has no account for x@y.z"),
+		finishErr: errors.New("that login link was rejected"),
+	}
+	c := serve(t, h)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := c.LoginStart(ctx, "x@y.z"); err == nil || !strings.Contains(err.Error(), "no account") {
+		t.Errorf("LoginStart err = %v, want the handler's own message", err)
+	}
+	if _, err := c.LoginFinish(ctx, "whatever"); err == nil || !strings.Contains(err.Error(), "rejected") {
+		t.Errorf("LoginFinish err = %v, want the handler's own message", err)
+	}
+}
+
+// TestEveryStatusCarriesTheAccount is the reason Account is stamped by the
+// server instead of left to each handler. A front end flips between its login
+// screen and its main screen on this field, so a command that returned a status
+// without it — a connect, say — would bounce the window to the wrong one.
+func TestEveryStatusCarriesTheAccount(t *testing.T) {
+	h := &stubHandler{signedIn: true, accountName: "me@example.com"}
+	c := serve(t, h)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	calls := map[string]func() (*Status, error){
+		"status":     func() (*Status, error) { return c.Status(ctx) },
+		"connect":    func() (*Status, error) { return c.Connect(ctx, Target{}) },
+		"disconnect": func() (*Status, error) { return c.Disconnect(ctx) },
+	}
+	for name, call := range calls {
+		st, err := call()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if !st.LoggedIn || st.Account != "me@example.com" {
+			t.Errorf("%s reply: logged_in %v account %q, want true and me@example.com", name, st.LoggedIn, st.Account)
+		}
+	}
+
+	st, err := c.Logout(ctx)
+	if err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	if st.LoggedIn || st.Account != "" {
+		t.Errorf("status after logout still says logged_in %v account %q", st.LoggedIn, st.Account)
 	}
 }

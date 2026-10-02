@@ -127,7 +127,7 @@ func (e *Exchanger) ExchangeCode(ctx context.Context, verifier, code string) (*T
 		if status == http.StatusBadRequest || status == http.StatusUnauthorized {
 			// Overwhelmingly this is an expired or already-used link. The API's
 			// own wording for it is not something a person can act on.
-			return nil, fmt.Errorf("that login link was rejected — it may have expired or been used already; run the command again for a new one")
+			return nil, fmt.Errorf("that login link was rejected — it may have expired or been used already; ask for a new one")
 		}
 		return nil, fmt.Errorf("exchange login code: HTTP %d: %s", status, truncate(string(raw), 300))
 	}
@@ -210,7 +210,7 @@ func ParseCode(input string) string {
 		// Some flows put it in the fragment instead.
 		if u.Fragment != "" {
 			if frag, err := url.ParseQuery(u.Fragment); err == nil {
-				if code := firstNonEmpty(frag.Get("code"), frag.Get("authorization_code")); code != "" {
+				if code := firstNonEmpty(frag.Get("code"), frag.Get("authorization_code"), frag.Get("activation_code")); code != "" {
 					return code
 				}
 			}

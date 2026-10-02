@@ -39,6 +39,12 @@ const (
 	CmdLocations  = "locations"
 	CmdLogin      = "login"
 	CmdLogout     = "logout"
+
+	// CmdLoginStart and CmdLoginFinish are the two halves of the magic-link
+	// login. They are separate commands because a person sits between them:
+	// the link arrives by email, and nothing here can read it for them.
+	CmdLoginStart  = "login-start"
+	CmdLoginFinish = "login-finish"
 )
 
 // Target names where a tunnel should exit.
@@ -72,6 +78,14 @@ type Request struct {
 	// is a symlink attack waiting to happen. The payload is a few kilobytes and
 	// crosses a socket that is already the trust boundary.
 	Credentials json.RawMessage `json:"credentials,omitempty"`
+
+	// Email is where CmdLoginStart sends the login link.
+	Email string `json:"email,omitempty"`
+
+	// Code is what the person pasted back for CmdLoginFinish: the whole link
+	// from the email, or just the code in it. The daemon does the parsing, so
+	// every front end accepts the same shapes.
+	Code string `json:"code,omitempty"`
 }
 
 // LocationCity is a city a country can exit through, as sent to front ends.
@@ -149,6 +163,18 @@ type Status struct {
 	// LastError carries the most recent failure, so `myst status` can explain
 	// why a connection dropped without the user reading logs.
 	LastError string `json:"last_error,omitempty"`
+
+	// LoggedIn reports whether the daemon holds credentials. It is always
+	// sent, false included: a front end that read a missing field as "signed
+	// out" would put a login screen over a working account the moment it met a
+	// daemon too old to send it, so the front ends decode it as a pointer and
+	// treat absence as unknown.
+	LoggedIn bool `json:"logged_in"`
+
+	// Account is the email the stored credentials were issued for. Empty when
+	// signed out, and also for credentials imported from a file, which carry
+	// no address — LoggedIn is the field that says whether there is an account.
+	Account string `json:"account,omitempty"`
 }
 
 // Response is the daemon's reply.
@@ -205,6 +231,20 @@ type Handler interface {
 	// Logout deletes the stored credentials. Served from here for the same
 	// reason: the file is not the caller's to remove.
 	Logout(ctx context.Context) (*Status, error)
+
+	// LoginStart asks the API to email a login link to the address. The PKCE
+	// verifier that makes the link redeemable stays in the daemon, so the link
+	// is useless to anything that merely reads the email.
+	LoginStart(ctx context.Context, email string) (*Status, error)
+
+	// LoginFinish redeems what the person pasted from that email and, on
+	// success, stores the resulting credentials as Login does.
+	LoginFinish(ctx context.Context, pasted string) (*Status, error)
+
+	// Account reports whether credentials are stored and whom they belong to.
+	// The server stamps the answer onto every status it sends, so a front end
+	// learns it from the same poll that tells it about the tunnel.
+	Account() (loggedIn bool, account string)
 }
 
 // Server listens on a unix socket and dispatches to a Handler.
@@ -225,7 +265,8 @@ func (s *Server) Listen() error {
 	if s.Path == "" {
 		s.Path = DefaultSocketPath
 	}
-	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
+	dir := filepath.Dir(s.Path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create socket dir: %w", err)
 	}
 
@@ -274,6 +315,16 @@ func (s *Server) applyGroup() error {
 	// outright for any caller that is not already root.
 	if err := os.Chown(s.Path, -1, gid); err != nil {
 		return fmt.Errorf("chown socket to group %q: %w", s.Group, err)
+	}
+	// The parent directory is created 0700 for the root-only default. When a
+	// client group is configured, the directory must also be traversable by
+	// that group; otherwise a 0660 socket is still unreachable.
+	dir := filepath.Dir(s.Path)
+	if err := os.Chown(dir, -1, gid); err != nil {
+		return fmt.Errorf("chown socket directory to group %q: %w", s.Group, err)
+	}
+	if err := os.Chmod(dir, 0o750); err != nil {
+		return fmt.Errorf("chmod socket directory: %w", err)
 	}
 	return nil
 }
@@ -370,8 +421,19 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		status, herr = s.Handler.Login(callCtx, req.Credentials)
 	case CmdLogout:
 		status, herr = s.Handler.Logout(callCtx)
+	case CmdLoginStart:
+		status, herr = s.Handler.LoginStart(callCtx, req.Email)
+	case CmdLoginFinish:
+		status, herr = s.Handler.LoginFinish(callCtx, req.Code)
 	default:
 		herr = fmt.Errorf("unknown command %q", req.Command)
+	}
+
+	// Stamped here, after the command, so every reply carries the account and
+	// no handler has to remember to. It is read after the command rather than
+	// before because a login or logout changes it.
+	if status != nil {
+		status.LoggedIn, status.Account = s.Handler.Account()
 	}
 
 	if herr != nil {

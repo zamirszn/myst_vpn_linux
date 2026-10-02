@@ -15,11 +15,10 @@ import (
 
 // ClientID identifies this client to the auth server.
 //
-// "extension" is the closest fit among the closed set the API accepts
-// (web | app | extension | router) for a non-official desktop client. It is a
-// placeholder to settle with Mysterium before distributing anything — shipping
-// while claiming to be the Chrome extension is not honest labelling.
-const ClientID = "extension"
+// "app" is the consumer-app identity used by the official client flow.
+// Keeping the same client identity is important because auth policy can differ
+// between web, extension, router, and app clients.
+const ClientID = "app"
 
 // Token is an OAuth token set as returned by POST /oauth/token.
 type Token struct {
@@ -28,6 +27,12 @@ type Token struct {
 	TokenType    string `json:"token_type,omitempty"`
 	ExpiresIn    int    `json:"expires_in,omitempty"`
 	UserID       string `json:"user_id,omitempty"`
+
+	// Email is the address the magic link was sent to, kept so a front end can
+	// say who is signed in. The API's token response does not carry it, so it
+	// is only known for a login this client performed itself; a token imported
+	// from a file has none, and callers must cope with it being empty.
+	Email string `json:"email,omitempty"`
 
 	// ObtainedAt is set locally, since the server reports a relative lifetime.
 	ObtainedAt time.Time `json:"obtained_at"`

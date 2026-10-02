@@ -1,0 +1,33 @@
+# ---- credentials and captured session data: never commit ----
+.myst-env
+.myst-capture/
+tokens.json
+token-from-browser.json
+proxy-config.json
+wireguard-config.json
+router.conf
+*.conf
+requests.ndjson
+magic-code.txt
+profile/
+*.token
+*.pem
+*.key
+
+# reference/ is a deliberate, consented backup of the WireGuard key material
+# (see reference/README.md for the reasoning and the blast radius).
+# Only those two files are un-ignored; the account token stays excluded above.
+!reference/
+!reference/*.conf
+!reference/*.json
+
+# ---- runtime noise ----
+*.log
+node_modules/
+.DS_Store
+
+# ---- build output ----
+/myst
+/mystd
+/desktop/myst-tray
+/desktop/myst-gui

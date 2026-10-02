@@ -107,6 +107,40 @@ button.chip {
 button.chip:hover { background-color: @field_hi; }
 button.chip:disabled { opacity: 0.45; }
 
+/* Sign out, once clicked: the colour says "this will do something". */
+button.chip.armed { background-color: #8c3b52; }
+button.chip.armed:hover { background-color: #a14561; }
+
+/* a quiet text button, for the secondary actions on the login screen */
+button.link-btn {
+	background-color: transparent;
+	color: @muted;
+	padding: 4px 8px;
+	font-size: 13px;
+}
+button.link-btn:hover { color: #ffffff; }
+button.link-btn:disabled { opacity: 0.45; }
+
+/* --- login ------------------------------------------------------------- */
+
+.login-title {
+	font-size: 22px;
+	font-weight: 700;
+	color: #ffffff;
+}
+.login-sub {
+	color: @muted;
+	font-size: 13px;
+}
+.error-text {
+	color: #ff8f9d;
+	font-size: 13px;
+}
+.account-label {
+	color: @muted;
+	font-size: 12px;
+}
+
 /* --- inputs ------------------------------------------------------------ */
 
 searchentry, entry {

@@ -59,6 +59,36 @@ type window struct {
 	ipv6    *gtk.Label
 	ks      *gtk.Label
 
+	// The window has two screens, and the daemon's answer to "is anyone signed
+	// in?" chooses between them. See login.go.
+	screens    *gtk.Stack
+	login      loginView
+	accountBar *gtk.Box
+	account    *gtk.Label
+	signOut    *gtk.Button
+
+	// loginBusy is true while a login request is out, so a second click cannot
+	// start a second link.
+	loginBusy atomic.Bool
+
+	// signOutArmed is whether the Sign out button is waiting for its second
+	// click, and armSeq retires the timer that would put it back. Only the main
+	// loop touches them.
+	signOutArmed bool
+	armSeq       int
+
+	// notice is a message that has to survive the next poll: the detail line is
+	// repainted from the daemon's status every two seconds, which would wipe an
+	// error that has nowhere else to live. Cleared when the person acts again.
+	// Only the main loop touches it.
+	notice string
+
+	// epoch counts account changes. A lookup records it before it starts and is
+	// discarded if it moved, so a country list fetched for the account that just
+	// signed out cannot fill the picker of the one that signed in. Only the main
+	// loop touches it.
+	epoch int
+
 	// busy is true while a connect or disconnect is in flight. The daemon
 	// publishes its own state for the button's label, but only this knows when
 	// to hand the button back after a failure that never reached the daemon.
@@ -243,10 +273,18 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	brand.SetMarkup(`<span weight="heavy">MYSTERIUM</span><span weight="light">VPN</span>`)
 	brand.AddCSSClass("brand")
 	brand.SetHAlign(gtk.AlignStart)
-	brand.SetMarginTop(18)
-	brand.SetMarginBottom(6)
-	brand.SetMarginStart(20)
-	brand.SetMarginEnd(20)
+	brand.SetHExpand(true)
+
+	// The wordmark on the left; who is signed in, and the way out, on the right.
+	// The account half is hidden until the daemon says someone is.
+	topbar := gtk.NewBox(gtk.OrientationHorizontal, 8)
+	topbar.SetMarginTop(18)
+	topbar.SetMarginBottom(6)
+	topbar.SetMarginStart(20)
+	topbar.SetMarginEnd(20)
+	topbar.Append(brand)
+	topbar.Append(w.buildAccountBar())
+	w.accountBar.SetVisible(false)
 
 	// The status and the one button that acts on it share a card, so the
 	// button reads as belonging to the state above it.
@@ -293,10 +331,19 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	scroller.SetVExpand(true)
 	scroller.SetChild(body)
 
+	// Which of the two is showing is the daemon's call, made in apply. It opens
+	// on the main screen so a daemon too old to say anything about accounts is
+	// never greeted with a login form.
+	w.screens = gtk.NewStack()
+	w.screens.SetVExpand(true)
+	w.screens.AddNamed(scroller, "main")
+	w.screens.AddNamed(w.buildLogin(), "login")
+	w.screens.SetVisibleChildName("main")
+
 	root := gtk.NewBox(gtk.OrientationVertical, 0)
 	root.Append(w.banner)
-	root.Append(brand)
-	root.Append(scroller)
+	root.Append(topbar)
+	root.Append(w.screens)
 
 	w.win.SetChild(root)
 
@@ -577,11 +624,15 @@ func (w *window) pickSearchResult(m regions.CityMatch) {
 // attempt at a time per type, asked for only until it succeeds, and silent on
 // failure — the countries picker already works without it.
 func (w *window) loadPlaces() {
+	if w.shown.SignedOut() {
+		return
+	}
 	t := w.selectedIPType()
 	if _, ok := w.placesByType[t]; ok || w.loadingPlaces[t] {
 		return
 	}
 	w.loadingPlaces[t] = true
+	epoch := w.epoch
 
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -605,6 +656,9 @@ func (w *window) loadPlaces() {
 		}
 
 		w.onMain(func() {
+			if w.epoch != epoch {
+				return // asked for a previous account; its map was already replaced
+			}
 			delete(w.loadingPlaces, t)
 			if len(list) == 0 {
 				return
@@ -769,6 +823,7 @@ func (w *window) run(op func(context.Context) (*daemonclient.Status, error)) {
 	if !w.busy.CompareAndSwap(false, true) {
 		return
 	}
+	w.notice = ""
 	w.action.SetSensitive(false)
 
 	go func() {
@@ -803,7 +858,38 @@ func (w *window) onScreen() daemonclient.Status { return w.shown }
 // apply renders a status from the daemon. It is the only place the widgets are
 // written from a status, so the window cannot disagree with itself.
 func (w *window) apply(st daemonclient.Status) {
+	wasOut := w.shown.SignedOut()
 	w.shown = st
+
+	// No account means no tunnel to show and nothing to pick: the login screen
+	// stands in for the whole main screen.
+	if st.SignedOut() {
+		// Shown before it is reset: focus can only land on a widget that is on
+		// screen.
+		w.screens.SetVisibleChildName("login")
+		w.accountBar.SetVisible(false)
+		w.setBanner("", false)
+		if !wasOut {
+			w.onAccountChanged()
+			w.showLoginEmail()
+		}
+		return
+	}
+	if wasOut {
+		// Someone just signed in. Whatever the pickers held belonged to nobody
+		// now, and they refill from the new account on the next poll.
+		w.onAccountChanged()
+	}
+	w.screens.SetVisibleChildName("main")
+
+	// Shown only when the daemon spoke to accounts at all; an older one says
+	// nothing, and a Sign out button for it would have nothing to call.
+	w.accountBar.SetVisible(st.LoggedIn != nil)
+	if st.Account != "" {
+		w.account.SetText(st.Account)
+	} else {
+		w.account.SetText("Signed in")
+	}
 
 	switch st.State {
 	case daemonclient.StateConnected:
@@ -822,6 +908,9 @@ func (w *window) apply(st daemonclient.Status) {
 		w.heading.SetMarkup("<b>Not connected</b>")
 		w.detail.SetText(w.idleLine(st))
 		w.setBanner("", false)
+	}
+	if w.notice != "" {
+		w.detail.SetText(w.notice)
 	}
 	w.styleAction(st.State == daemonclient.StateConnected)
 
@@ -888,12 +977,13 @@ func (w *window) selectRegion(code string) { w.region.SetSelected(regionRow(w.ch
 // repeat: it is only asked for until it succeeds. The built-in fallback stays
 // on screen until then, so a window opened before the daemon is up still works.
 func (w *window) loadCountries() {
-	if w.haveCountries.Load() {
-		return
+	if w.haveCountries.Load() || w.shown.SignedOut() {
+		return // already have them, or nobody to ask on behalf of
 	}
 	if !w.loadingCountries.CompareAndSwap(false, true) {
 		return // one attempt in flight is enough
 	}
+	epoch := w.epoch
 	go func() {
 		defer w.loadingCountries.Store(false)
 
@@ -908,6 +998,9 @@ func (w *window) loadCountries() {
 		}
 		list := regions.FromCodes(codes)
 		w.onMain(func() {
+			if w.epoch != epoch {
+				return // asked for a previous account
+			}
 			if w.haveCountries.Swap(true) {
 				return // a slower earlier request beat us to it
 			}

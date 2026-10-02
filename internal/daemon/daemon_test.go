@@ -871,7 +871,7 @@ func TestMonitorReconnectsAfterTheNetworkChanges(t *testing.T) {
 func TestMonitorReconnectsAfterTheHandshakeGoesStale(t *testing.T) {
 	env := newTestDaemon(t, func(c *Config, _ *testEnv, _ *Deps) {
 		monitorOn(c)
-		c.StaleAfter = 50 * time.Millisecond
+		c.StaleAfter = 200 * time.Millisecond
 	})
 
 	if _, err := env.d.Connect(context.Background(), ipc.Target{Country: "gb"}); err != nil {

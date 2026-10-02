@@ -213,9 +213,9 @@ only bearer is usable outside a browser.
 
 ### Client identity
 
-Testing used `client_id=extension`, which labels a Linux client as the Chrome
-extension. Acceptable for personal testing on your own account; a question to
-resolve with Mysterium before distributing.
+The login flow uses `client_id=app`, matching the consumer-app auth identity.
+The Linux UI remains a third-party client, so distribution/branding should still
+be reviewed with Mysterium before shipping it publicly.
 
 ---
 

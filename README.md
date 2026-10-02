@@ -29,11 +29,18 @@ Not built yet — the `.deb` is part of the remaining work. Until then, see
 ### Log in once
 
 ```sh
-myst login --from ~/token.json
+myst login
 ```
 
-Imports a captured token so the client can authenticate without a browser. See
-[Logging in](#logging-in) for where to get one.
+Asks for your email, sends you a login link, and waits for you to paste it back.
+The window does the same thing as a form: it opens on a login screen whenever
+nobody is signed in. See [Logging in](#logging-in).
+
+If you would rather import a token you captured yourself:
+
+```sh
+myst login --from ~/token.json
+```
 
 ### Connect
 
@@ -76,7 +83,9 @@ myst-gui
 ```
 
 A window with the state, a Connect/Disconnect button, a region picker, the exit
-IP with a Copy button, and indicators for IPv6 and the kill switch. It polls the
+IP with a Copy button, and indicators for IPv6 and the kill switch. It opens on a
+login screen until someone is signed in, and shows who, with a Sign out button,
+afterwards. It polls the
 daemon every two seconds, so a change made anywhere else — from the CLI, from the
 tray, or by the health monitor repairing a dropped tunnel — shows up there
 within a moment.
@@ -163,8 +172,9 @@ automatically if the daemon dies.
 
 | Command | What it does |
 |---|---|
-| `myst login --from <token.json>` | import a captured token (`-` reads stdin) |
-| `myst logout` | forget the stored token |
+| `myst login [--email you@example.com]` | log in with an emailed link |
+| `myst login --from <token.json>` | import a captured token instead (`-` reads stdin) |
+| `myst logout` | close any tunnel and forget the stored token |
 | `myst connect [--country XX] [--ip-type hosting\|residential]` | bring the tunnel up |
 | `myst disconnect` | tear it down |
 | `myst status [--json]` | state, region, exit IP, kill switch, wake lock |
@@ -262,7 +272,7 @@ connect time.
 
 **Not yet settled:** whether two WireGuard connections can handshake
 simultaneously on one account, a terms-of-service review for third-party clients,
-and the magic-link login flow (today you import a captured token instead).
+and the emailed-link login against a live account (see [Logging in](#logging-in)).
 
 **Client identity.** Testing used `client_id=extension`, which labels a Linux
 client as the Chrome extension. Acceptable for personal testing on your own
@@ -272,19 +282,68 @@ account; a question to resolve with Mysterium before distributing.
 
 ## Logging in
 
-The client needs a bearer token. There is no browser flow implemented yet, so
-import one captured from the dashboard's own traffic:
+Logging in works the way the official app does: you give your email address, the
+API emails you a link, and the link logs you in.
 
 ```sh
-myst login --from ~/token.json
+myst login
 ```
+
+```
+email: you@example.com
+A login link is on its way to you@example.com.
+
+Open the email and paste its link here (or just the code from it).
+The link only works for a few minutes.
+
+link: https://…
+logged in as you@example.com
+```
+
+The window asks the same two questions on its login screen: an address, then the
+link. **Log out** is the Sign out button in the window's top corner, or
+`myst logout`; either closes a live tunnel first and then deletes the stored
+credentials.
+
+**You paste the link rather than clicking it.** The official app is registered to
+catch the link and opens itself. A third-party client cannot be, so in the email
+right-click the link and choose *Copy link address*, then paste that. If clicking
+it lands on a web page, that page's address works too. Either way you can paste
+the whole link or only the code in it.
+
+The daemon does the exchange and keeps the secret that makes the link redeemable,
+so the window and the CLI stay free of credentials, as before. The consequence is
+that restarting `mystd` between asking for the link and pasting it loses the
+secret; ask for a new link.
 
 Credentials land in `/var/lib/mystd/token.json` at 0600. Tokens last about 30
 days and carry a refresh token, so the client renews itself indefinitely after
 that — you should not have to do this again.
 
-The headless magic-link flow is designed but not built; see
-[docs/api-notes.md](docs/api-notes.md) for the API contract.
+**What logging out does not do.** It removes the credentials from this machine and
+releases the account's connection. It does not tell the API to revoke the refresh
+token, because no endpoint for that has been verified. Treat a token you have
+imported or logged in with as live until it expires.
+
+**Not yet confirmed end to end.** The request and response shapes come from the
+API's own validation errors and are covered by tests, but the emailed-link flow
+has not been run against a live account from this client. Two things worth
+watching on the first real login: whether the link carries the code in a form the
+parser recognises (it accepts `code`, `authorization_code` and `activation_code`
+in the query or fragment, or a bare code), and whether the API creates an account
+for an address it has not seen or answers 404 as the CLI assumes.
+
+To import a token you captured another way instead:
+
+```sh
+myst login --from ~/token.json
+```
+
+`--from -` reads standard input. Before this was added, `myst login` with no
+arguments read a token from standard input; it now starts the emailed-link flow,
+so piped tokens need the explicit `--from -`.
+
+See [docs/api-notes.md](docs/api-notes.md) for the API contract.
 
 ---
 
@@ -590,3 +649,72 @@ The API is not publicly documented. Everything known about it — the endpoints,
 the auth flows, the IPv6 gap, the proxy port that lies — is written up in
 [docs/api-notes.md](docs/api-notes.md), along with the probe scripts that
 established it. Nothing there is needed to install or use the client.
+
+## Single-binary release build
+
+The release build uses one executable for both the normal CLI and the privileged
+control daemon. The daemon is selected internally with `--daemon`; normal
+commands automatically start the same executable through `sudo` when the
+standard daemon socket is not available.
+
+Build it with:
+
+```bash
+./build-release.sh
+```
+
+This creates:
+
+```text
+./myst
+```
+
+You can then use:
+
+```bash
+./myst version
+./myst login
+./myst status
+./myst connect
+./myst disconnect
+./myst logout
+```
+
+The first command that needs the daemon may ask for administrator authentication.
+The daemon is detached from the CLI and uses the invoking user's primary group
+for access to `/run/mystd/mystd.sock`.
+
+For a custom output path:
+
+```bash
+./build-release.sh --output ./release/myst
+```
+
+For a reproducible version string:
+
+```bash
+VERSION=2.0.0 ./build-release.sh
+```
+
+The desktop GTK application remains a separate CGO/GTK target because GTK4 is
+not part of the standard Go toolchain. The single-binary release target here is
+the complete CLI + privileged daemon control plane; it does not copy GTK
+runtime libraries into the executable.
+
+## Single-binary desktop release
+
+The release build produces one executable named `myst`. The executable contains
+both the GTK desktop application and the privileged daemon implementation.
+
+```bash
+./build-release.sh
+./myst
+```
+
+Running `./myst` opens the GUI. The GUI starts the same executable as
+`./myst --daemon` through `pkexec` when the privileged backend is not already
+running. Login, logout, account state, locations, and VPN controls are all
+available from the GUI; a separate `mystd` binary is not required.
+
+The GTK runtime itself remains a normal Linux shared-library dependency. The
+application code and daemon are linked into the same ELF executable.

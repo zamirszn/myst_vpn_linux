@@ -70,6 +70,7 @@ func TestParseCode(t *testing.T) {
 		{"a link with the code first", "https://x.test/cb?code=abc123def456", "abc123def456"},
 		{"a bare code", "abc123def456", "abc123def456"},
 		{"a code in the fragment", "https://x.test/cb#code=abc123def456", "abc123def456"},
+		{"activation code in the fragment", "https://x.test/cb#activation_code=abc123def456", "abc123def456"},
 		{"surrounding whitespace", "  https://x.test/cb?code=abc123def456  ", "abc123def456"},
 		{"the alternate parameter name", "https://x.test/cb?authorization_code=abc123def456", "abc123def456"},
 		{"a link with no code", "https://x.test/welcome", ""},

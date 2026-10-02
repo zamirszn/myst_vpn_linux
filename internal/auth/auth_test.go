@@ -212,3 +212,38 @@ func TestEnsureValidOnlyRefreshesWhenNeeded(t *testing.T) {
 		t.Error("refreshed token was not persisted")
 	}
 }
+
+// TestRefreshKeepsWhoIsSignedIn: the token response never names the account, so
+// a refresh that did not carry the email forward would erase it from the file
+// and the window would stop saying who is signed in, about once a month.
+func TestRefreshKeepsWhoIsSignedIn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"access_token": "new-access", "expires_in": 3600})
+	}))
+	defer srv.Close()
+
+	got, err := NewExchanger(srv.URL).Refresh(context.Background(),
+		&Token{RefreshToken: "old-refresh", Email: "someone@example.com"})
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if got.Email != "someone@example.com" {
+		t.Errorf("Email = %q after refresh, want it carried forward", got.Email)
+	}
+}
+
+// TestEmailSurvivesTheStore guards the JSON tag: an email that is not written
+// to disk is one the daemon cannot report after a restart.
+func TestEmailSurvivesTheStore(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "token.json")}
+	if err := store.Save(&Token{AccessToken: "a", Email: "someone@example.com"}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Email != "someone@example.com" {
+		t.Errorf("Email = %q after a save and load, want someone@example.com", got.Email)
+	}
+}

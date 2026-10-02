@@ -201,6 +201,10 @@ type Deps struct {
 	AcquireLock LockFunc
 	KillSwitch  KillSwitch
 	Logger      *slog.Logger
+
+	// Magic performs the two network steps of a magic-link login. It defaults
+	// to the same exchanger that refreshes tokens.
+	Magic MagicLinker
 }
 
 // Daemon implements ipc.Handler.
@@ -257,6 +261,19 @@ type Daemon struct {
 	// holding either of the others.
 	locsMu sync.Mutex
 	locs   map[string]locationEntry
+
+	// magic is the auth server, for the login flow.
+	magic MagicLinker
+
+	// loginMu guards pending. Like locsMu it is separate from mu on purpose:
+	// nothing here may be held across a network call either, and keeping it
+	// apart means a person pasting a link never makes `myst status` wait.
+	//
+	// Lock order is opMu, then loginMu, then mu; nothing takes opMu while
+	// holding loginMu. LoginFinish releases loginMu before calling Login, which
+	// takes opMu, for exactly that reason.
+	loginMu sync.Mutex
+	pending *pendingLogin
 }
 
 // region is a connection target, as the API understands it.
@@ -351,6 +368,9 @@ func New(cfg Config, deps Deps) *Daemon {
 	if deps.KillSwitch == nil {
 		deps.KillSwitch = killswitch.Nft{}
 	}
+	if deps.Magic == nil {
+		deps.Magic = auth.NewExchanger(cfg.BaseURL)
+	}
 
 	return &Daemon{
 		cfg:    cfg,
@@ -363,6 +383,7 @@ func New(cfg Config, deps Deps) *Daemon {
 		log:    deps.Logger,
 		status: ipc.Status{State: ipc.StateDisconnected},
 		locs:   map[string]locationEntry{},
+		magic:  deps.Magic,
 	}
 }
 
@@ -1099,11 +1120,12 @@ func (d *Daemon) Logout(ctx context.Context) (*ipc.Status, error) {
 	defer d.opMu.Unlock()
 
 	// Same ordering as Login: release the account's connection while the token
-	// that opened it is still on disk.
+	// that opened it is still on disk. A failed local teardown is different from
+	// a failed server-side cleanup: if the interface is down, the user must still
+	// be able to sign out locally rather than being trapped on the login screen.
+	var teardownErr error
 	if st := d.snapshot(); st.State == ipc.StateConnected || st.State == ipc.StateReconnecting {
-		if _, err := d.disconnectLocked(ctx); err != nil {
-			return d.snapshot(), fmt.Errorf("a tunnel is up and could not be closed: %w", err)
-		}
+		_, teardownErr = d.disconnectLocked(ctx)
 	}
 
 	if err := d.store.Delete(); err != nil {
@@ -1111,7 +1133,14 @@ func (d *Daemon) Logout(ctx context.Context) (*ipc.Status, error) {
 	}
 	d.forgetLocations()
 	d.log.Info("credentials removed")
-	return d.snapshot(), nil
+
+	st := d.snapshot()
+	if teardownErr != nil {
+		// The credentials are already gone, so report the cleanup problem without
+		// pretending the account is still signed in.
+		return st, fmt.Errorf("signed out locally, but tunnel cleanup reported: %w", teardownErr)
+	}
+	return st, nil
 }
 
 // teardown undoes a connection. Caller holds opMu.
@@ -1152,9 +1181,20 @@ func (d *Daemon) teardown(ctx context.Context, wakeLock bool) error {
 	}
 
 	// Release server-side even if the local half failed, so the account does
-	// not accumulate connections it believes are still live.
+	// not accumulate connections it believes are still live. Use the same
+	// token-refresh path as connect: logout/disconnect can happen weeks after
+	// login, when the access token is expired but the refresh token is still
+	// valid. Falling back to the stale access token here used to make logout
+	// fail with 401 and leave the credential file behind.
 	if tok, err := d.store.Load(); err == nil && tok.AccessToken != "" {
-		if err := d.apiFor(tok.AccessToken).Disconnect(ctx); err != nil {
+		valid := tok
+		if refreshed, refreshErr := d.tokens.EnsureValid(ctx, d.store, 0); refreshErr == nil {
+			valid = refreshed
+		} else if !errors.Is(refreshErr, auth.ErrRefreshRejected) {
+			errs = append(errs, fmt.Errorf("refresh credentials for server-side disconnect: %w", refreshErr))
+		}
+
+		if err := d.apiFor(valid.AccessToken).Disconnect(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("release server-side connection: %w", err))
 		}
 	}

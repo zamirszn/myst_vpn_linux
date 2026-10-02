@@ -131,3 +131,18 @@ func (c Client) Login(ctx context.Context, credentials []byte) (*Status, error) 
 func (c Client) Logout(ctx context.Context) (*Status, error) {
 	return c.Call(ctx, Request{Command: CmdLogout})
 }
+
+// LoginStart asks the daemon to email a login link to the address.
+//
+// It is the first half of the magic-link login. The daemon keeps the PKCE
+// verifier, so the second half, LoginFinish, has to go to the same daemon
+// process — restarting mystd in between means asking for a new link.
+func (c Client) LoginStart(ctx context.Context, email string) (*Status, error) {
+	return c.Call(ctx, Request{Command: CmdLoginStart, Email: email})
+}
+
+// LoginFinish redeems the link, or the code in it, that the person pasted from
+// the email, and stores the credentials it yields.
+func (c Client) LoginFinish(ctx context.Context, pasted string) (*Status, error) {
+	return c.Call(ctx, Request{Command: CmdLoginFinish, Code: pasted})
+}
