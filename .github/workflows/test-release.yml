@@ -41,7 +41,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libgtk-4-dev \
+            build-essential pkg-config libgtk-4-dev gobject-introspection \
             desktop-file-utils xvfb dbus-x11 xdotool imagemagick zip
 
       - name: Run unit tests

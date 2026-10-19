@@ -10,7 +10,7 @@ Install build prerequisites:
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential pkg-config libgtk-4-dev policykit-1 zip golang-go
+sudo apt install -y build-essential pkg-config libgtk-4-dev gobject-introspection policykit-1 zip golang-go
 ```
 
 Then run from the repository root:

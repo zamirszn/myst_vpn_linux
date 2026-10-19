@@ -19,7 +19,7 @@ command -v dpkg-deb >/dev/null || { echo 'ERROR: dpkg-deb is required.' >&2; exi
 command -v pkg-config >/dev/null || { echo 'ERROR: pkg-config is required.' >&2; exit 1; }
 pkg-config --exists gtk4 || {
   echo 'ERROR: GTK 4 development files are missing.' >&2
-  echo 'On Ubuntu/Debian: sudo apt update && sudo apt install -y build-essential pkg-config libgtk-4-dev' >&2
+  echo 'On Ubuntu/Debian: sudo apt update && sudo apt install -y build-essential pkg-config libgtk-4-dev gobject-introspection' >&2
   exit 1
 }
 

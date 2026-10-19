@@ -373,6 +373,7 @@ See [docs/api-notes.md](docs/api-notes.md) for the API contract.
 | Go 1.22 or newer | everything | the root module declares 1.22.2 |
 | Go 1.24 or newer | the window | the desktop module declares 1.24.0 |
 | `libgtk-4-dev` | the window | `sudo apt install libgtk-4-dev` |
+| `gobject-introspection` | the window | provides `gobject-introspection-1.0.pc` for the GTK bindings |
 | `nftables` | the kill switch | degrade: no filter is installed |
 | `wireguard-tools` | the tunnel | **required** — `wg` and `wg-quick` |
 | `iproute2` | the tunnel | **required** — `ip` |
@@ -395,7 +396,7 @@ directly. Everything except `myst-gui` builds with `CGO_ENABLED=0`.
 ### Build
 
 ```sh
-sudo apt install libgtk-4-dev        # only needed for the window
+sudo apt install libgtk-4-dev gobject-introspection   # only needed for the window
 
 # daemon and CLI — static, no cgo
 CGO_ENABLED=0 go build -o mystd ./cmd/mystd
