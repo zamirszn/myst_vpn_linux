@@ -77,8 +77,13 @@ jobs:
         run: |
           set -euo pipefail
           GROUP="$(id -gn)"
-          SOCKET=/tmp/mystd-ci.sock
-          sudo mkdir -p /run/mystd
+          SOCKET_DIR=/run/mystd-ci
+          SOCKET="$SOCKET_DIR/mystd.sock"
+
+          # The daemon chmods its socket's parent directory to 0750 and gives
+          # it the socket group. Never point it at /tmp: that would strip the
+          # runner's ability to create temp files in later steps.
+          sudo mkdir -p "$SOCKET_DIR"
           sudo /usr/lib/mysterium-vpn/mystd \
             -socket "$SOCKET" -socket-group "$GROUP" >/tmp/mystd.log 2>&1 &
           for _ in $(seq 1 50); do
@@ -144,8 +149,9 @@ jobs:
           xdotool search --onlyvisible --name 'Mysterium VPN' getwindowgeometry
 
           import -window root /tmp/mysterium-gui.png
+          cp /tmp/mysterium-gui.png dist/mysterium-gui.png
           echo '--- screenshot ---'
-          file /tmp/mysterium-gui.png
+          file dist/mysterium-gui.png
 
           pkill -f myst-gui || true
           kill "$GUI_JOB" 2>/dev/null || true
@@ -157,5 +163,5 @@ jobs:
           name: mysterium-vpn-ubuntu-test
           path: |
             dist/mysterium-vpn_1.0.0_amd64.deb
-            /tmp/mysterium-gui.png
+            dist/mysterium-gui.png
           if-no-files-found: warn
