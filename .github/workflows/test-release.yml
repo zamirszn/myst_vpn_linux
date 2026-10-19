@@ -36,13 +36,20 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+          # Cover both modules so the module and build caches are keyed on
+          # every go.sum in the repo.
+          cache-dependency-path: |
+            go.sum
+            desktop/go.sum
 
       - name: Install build and test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libgtk-4-dev gobject-introspection \
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: >-
+            build-essential pkg-config libgtk-4-dev gobject-introspection
             desktop-file-utils xvfb dbus-x11 xdotool imagemagick zip
+          # Bump this to force a fresh apt cache (e.g. after editing the list).
+          version: 1.0
 
       - name: Run unit tests
         run: |
