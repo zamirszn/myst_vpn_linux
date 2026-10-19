@@ -1,0 +1,161 @@
+name: Test release on clean Ubuntu
+
+# Runs the packaged app on a fresh GitHub-hosted Ubuntu VM: unit tests, the
+# .deb build and install, the daemon over its control socket, and the GTK
+# window under Xvfb. A real tunnel needs a Mysterium account, so that part is
+# deliberately out of scope.
+#
+# Note: hosted runners do not give a desktop session or a polkit agent. The
+# GUI is therefore probed only after a daemon is started explicitly, and the
+# "Start VPN service" button cannot be exercised here.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  package-and-run:
+    name: Ubuntu 24.04 amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the source and tags
+        uses: actions/checkout@v4
+        with:
+          # build-release.sh uses git describe for the version string.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libgtk-4-dev \
+            desktop-file-utils xvfb dbus-x11 xdotool imagemagick zip
+
+      - name: Run unit tests
+        run: |
+          go test ./...
+          (cd desktop && go test ./...)
+
+      - name: Build the .deb and portable archives
+        run: ./build-portable-package.sh
+
+      - name: Install the .deb like a user would
+        run: |
+          sudo apt-get install -y ./dist/mysterium-vpn_1.0.0_amd64.deb
+          test -x /usr/bin/myst-gui
+          test -x /usr/lib/mysterium-vpn/mystd
+          test -f /usr/lib/systemd/system/mystd.service
+          test -f /usr/share/applications/mysterium-vpn.desktop
+          desktop-file-validate /usr/share/applications/mysterium-vpn.desktop
+          dpkg -s mysterium-vpn | grep -E '^(Status|Version)'
+          echo '--- installed files ---'
+          dpkg -L mysterium-vpn | sort
+
+      - name: Validate the systemd unit
+        run: |
+          if command -v systemd-analyze >/dev/null 2>&1; then
+            systemd-analyze verify /usr/lib/systemd/system/mystd.service || true
+          fi
+
+      - name: Build the single-binary CLI
+        run: ./build-release.sh
+
+      - name: Start the daemon and query it over the control socket
+        run: |
+          set -euo pipefail
+          GROUP="$(id -gn)"
+          SOCKET=/tmp/mystd-ci.sock
+          sudo mkdir -p /run/mystd
+          sudo /usr/lib/mysterium-vpn/mystd \
+            -socket "$SOCKET" -socket-group "$GROUP" >/tmp/mystd.log 2>&1 &
+          for _ in $(seq 1 50); do
+            [ -S "$SOCKET" ] && break
+            sleep 0.2
+          done
+
+          echo '--- daemon log ---'
+          cat /tmp/mystd.log
+          test -S "$SOCKET" || { echo 'daemon did not create its socket'; exit 1; }
+
+          echo '--- status ---'
+          ./myst status -socket "$SOCKET"
+          echo '--- status (json) ---'
+          ./myst status -socket "$SOCKET" --json | tee /tmp/status.json
+          jq -e '.state' /tmp/status.json >/dev/null
+
+      - name: Launch the GUI under a virtual display and screenshot it
+        run: |
+          set -euo pipefail
+          export DISPLAY=:99
+          export GDK_BACKEND=x11
+          export GSK_RENDERER=cairo
+          export LIBGL_ALWAYS_SOFTWARE=1
+
+          Xvfb :99 -screen 0 1280x900x24 >/tmp/xvfb.log 2>&1 &
+          sleep 2
+
+          # Put a daemon on the default socket. Without one the GUI enters its
+          # pkexec repair path, which needs a polkit agent this runner does not
+          # have; the window would still open, but only after a 30s timeout.
+          sudo mkdir -p /run/mystd
+          sudo /usr/lib/mysterium-vpn/mystd \
+            -socket /run/mystd/mystd.sock -socket-group "$(id -gn)" \
+            >/tmp/mystd-gui.log 2>&1 &
+          for _ in $(seq 1 50); do
+            [ -S /run/mystd/mystd.sock ] && break
+            sleep 0.2
+          done
+
+          dbus-run-session -- /usr/bin/myst-gui >/tmp/gui.log 2>&1 &
+          GUI_JOB=$!
+
+          FOUND=""
+          for _ in $(seq 1 40); do
+            if xdotool search --onlyvisible --name 'Mysterium VPN' >/dev/null 2>&1; then
+              FOUND=yes
+              break
+            fi
+            sleep 0.5
+          done
+
+          echo '--- gui log ---'
+          cat /tmp/gui.log || true
+
+          if [ -z "$FOUND" ]; then
+            echo 'the GUI window never appeared'
+            pkill -f myst-gui || true
+            exit 1
+          fi
+
+          echo '--- window geometry ---'
+          xdotool search --onlyvisible --name 'Mysterium VPN' getwindowgeometry
+
+          import -window root /tmp/mysterium-gui.png
+          echo '--- screenshot ---'
+          file /tmp/mysterium-gui.png
+
+          pkill -f myst-gui || true
+          kill "$GUI_JOB" 2>/dev/null || true
+
+      - name: Upload the package and screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysterium-vpn-ubuntu-test
+          path: |
+            dist/mysterium-vpn_1.0.0_amd64.deb
+            /tmp/mysterium-gui.png
+          if-no-files-found: warn
