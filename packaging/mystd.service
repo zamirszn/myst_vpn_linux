@@ -5,7 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/mystd -socket-group myst
+# The launcher gives the control socket the primary group of the desktop user,
+# so the app works right after installation without adding accounts to a group
+# or requiring a log-out.
+ExecStart=/usr/lib/mysterium-vpn/mystd-launch
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes

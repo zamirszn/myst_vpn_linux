@@ -1,0 +1,78 @@
+#!/bin/sh
+# Print the primary group of the person using this desktop.
+#
+# The Mysterium control socket is accessible to exactly one group, because the
+# daemon behind it runs as root. Every Ubuntu desktop account already has its
+# own primary group, so using that group is what lets the app work immediately
+# after installation — no usermod, no log-out, no extra membership.
+#
+# Order of preference:
+#   1. MYSTERIUM_SOCKET_GROUP, for an administrator who wants to be explicit.
+#   2. SUDO_USER, when this is running under sudo (installer, dpkg via sudo).
+#   3. PKEXEC_UID, when a graphical installer runs dpkg through polkit.
+#   4. The user of the active x11/wayland session.
+#   5. The first ordinary account, for provisioning before anyone logs in.
+#
+# Outputs nothing and exits 0 when no suitable account exists; callers decide
+# whether that is fatal.
+set -eu
+
+group_from_user() {
+	[ -n "$1" ] || return 1
+	[ "$1" = root ] && return 1
+	# Only human accounts. A display manager's greeter runs as a system user
+	# with its own group (gdm, lightdm, sddm) and must never own the socket.
+	uid=$(id -u "$1" 2>/dev/null || true)
+	case "$uid" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ] || return 1
+	id -gn "$1" 2>/dev/null
+}
+
+group=""
+
+# An explicit group name is used as-is, provided it exists.
+if [ -n "${MYSTERIUM_SOCKET_GROUP:-}" ]; then
+	if getent group "$MYSTERIUM_SOCKET_GROUP" >/dev/null 2>&1; then
+		group=$MYSTERIUM_SOCKET_GROUP
+	fi
+fi
+
+# The remaining sources name a user; take that user's primary group.
+user=""
+if [ -z "$group" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+	user=$SUDO_USER
+elif [ -z "$group" ] && [ -n "${PKEXEC_UID:-}" ]; then
+	if entry=$(getent passwd "$PKEXEC_UID" 2>/dev/null); then
+		user=$(printf '%s\n' "$entry" | cut -d: -f1)
+	fi
+fi
+if [ -z "$group" ] && [ -n "$user" ]; then
+	group=$(group_from_user "$user" || true)
+fi
+
+# The user of the active x11/wayland session, ignoring SSH and TTY logins.
+if [ -z "$group" ] && command -v loginctl >/dev/null 2>&1; then
+	for id in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+		user=$(loginctl show-session "$id" -p Name --value 2>/dev/null || true)
+		type=$(loginctl show-session "$id" -p Type --value 2>/dev/null || true)
+		[ -n "$user" ] || continue
+		[ "$user" = root ] && continue
+		case "$type" in
+			x11|wayland) ;;
+			*) continue ;;
+		esac
+		group=$(group_from_user "$user" || true)
+		[ -n "$group" ] && break
+	done
+fi
+
+# The first ordinary account, for a machine provisioned before anyone logs in.
+if [ -z "$group" ]; then
+	user=$(getent passwd | awk -F: \
+		'$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ { print $1; exit }')
+	group=$(group_from_user "$user" || true)
+fi
+
+[ -n "$group" ] && printf '%s\n' "$group"

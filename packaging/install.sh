@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# Portable installer for the extracted archive.
+#
+# Most people should double-click the .deb instead; this script exists for
+# systems where no package manager will do it, and it is the only path that
+# needs a terminal. It still avoids the old log-out dance: the daemon's socket
+# is given the desktop user's primary group, which they already belong to.
 set -euo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -6,12 +12,8 @@ if [[ "${EUID}" -ne 0 ]]; then
   echo "Run this installer with sudo: sudo ./install.sh" >&2
   exit 1
 fi
-if [[ -z "${SUDO_USER:-}" || "${SUDO_USER}" == "root" ]]; then
-  echo "Run this as a normal desktop user with sudo, so the installer can grant socket access." >&2
-  echo "Example: sudo -u YOUR_USER sudo ./install.sh" >&2
-  exit 1
-fi
-for f in "$HERE/mystd" "$HERE/myst-gui" "$HERE/mystd.service" "$HERE/mysterium-vpn.desktop"; do
+for f in "$HERE/mystd" "$HERE/myst-gui" "$HERE/mystd-launch" "$HERE/desktop-group" \
+         "$HERE/mystd.service" "$HERE/mysterium-vpn.desktop"; do
   [[ -f "$f" ]] || { echo "Missing package file: $f" >&2; exit 1; }
 done
 
@@ -23,23 +25,56 @@ if ! command -v pkexec >/dev/null 2>&1; then
   echo "Warning: pkexec was not found. The GUI can still use the installed system daemon." >&2
 fi
 
+# Work out which group will own the control socket. On a normal Ubuntu desktop
+# this is the primary group of the person who ran sudo, so they are already a
+# member and no log-out is needed.
+SOCKET_GROUP="$(SUDO_USER="${SUDO_USER:-}" "$HERE/desktop-group" 2>/dev/null || true)"
+if [[ -z "$SOCKET_GROUP" ]]; then
+  echo "Warning: no desktop user was found. The service will resolve the group again when it starts." >&2
+fi
+
 # Back up existing binaries before replacing them, so a failed service restart
-# can be rolled back by the user from /usr/local/bin/*.pre-myst-package.
+# can be rolled back from /usr/local/bin/*.pre-myst-package.
 for bin in mystd myst-gui; do
   if [[ -x "/usr/local/bin/$bin" ]]; then
     cp -a "/usr/local/bin/$bin" "/usr/local/bin/$bin.pre-myst-package"
   fi
 done
 
-getent group myst >/dev/null || groupadd --system myst
-usermod -aG myst "$SUDO_USER"
+install -d -m 0755 /usr/local/lib/mysterium-vpn
 install -m 0755 "$HERE/mystd" /usr/local/bin/mystd
 install -m 0755 "$HERE/myst-gui" /usr/local/bin/myst-gui
-install -m 0644 "$HERE/mystd.service" /etc/systemd/system/mystd.service
-install -D -m 0644 "$HERE/mysterium-vpn.desktop" /usr/local/share/applications/mysterium-vpn.desktop
+install -m 0755 "$HERE/mystd-launch" /usr/local/lib/mysterium-vpn/mystd-launch
+install -m 0755 "$HERE/desktop-group" /usr/local/lib/mysterium-vpn/desktop-group
+
+# The unit in the archive points at the package location; the portable copy
+# runs the launcher from /usr/local. The launcher itself finds the daemon there.
+sed 's#/usr/lib/mysterium-vpn/mystd-launch#/usr/local/lib/mysterium-vpn/mystd-launch#' \
+  "$HERE/mystd.service" > /etc/systemd/system/mystd.service
+chmod 0644 /etc/systemd/system/mystd.service
+
+install -d -m 0755 /usr/local/share/applications
+sed 's#/usr/bin/myst-gui#/usr/local/bin/myst-gui#' \
+  "$HERE/mysterium-vpn.desktop" > /usr/local/share/applications/mysterium-vpn.desktop
+chmod 0644 /usr/local/share/applications/mysterium-vpn.desktop
+
+# Icons, if the archive carries them. They are optional: the app also embeds
+# its header mark, so this only affects the application-menu icon.
+if [[ -d "$HERE/icons" ]]; then
+  for size in 48 64 128 256 512; do
+    src="$HERE/icons/mysterium-vpn-${size}.png"
+    [[ -f "$src" ]] || continue
+    install -d -m 0755 "/usr/local/share/icons/hicolor/${size}x${size}/apps"
+    install -m 0644 "$src" "/usr/local/share/icons/hicolor/${size}x${size}/apps/mysterium-vpn.png"
+  done
+else
+  install -d -m 0755 /usr/local/share/icons/hicolor/256x256/apps
+  install -m 0644 "$HERE/mysterium-vpn.png" \
+    /usr/local/share/icons/hicolor/256x256/apps/mysterium-vpn.png 2>/dev/null || true
+fi
 
 systemctl daemon-reload
-systemctl enable mystd
+systemctl enable mystd >/dev/null 2>&1 || true
 if ! systemctl restart mystd; then
   echo "ERROR: mystd failed to start. Logs follow:" >&2
   journalctl -u mystd -n 60 --no-pager >&2 || true
@@ -47,8 +82,17 @@ if ! systemctl restart mystd; then
   exit 1
 fi
 
-printf '\nInstalled Mysterium VPN GUI and daemon.\n'
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -q -t /usr/local/share/icons/hicolor 2>/dev/null || true
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database -q /usr/local/share/applications 2>/dev/null || true
+fi
+
+printf '\nInstalled Mysterium VPN.\n'
+if [[ -n "$SOCKET_GROUP" ]]; then
+  printf 'The control socket is available to group %s — you are already in it, so no log-out is needed.\n' "$SOCKET_GROUP"
+fi
 printf 'Daemon status:\n'
 systemctl --no-pager --full status mystd || true
-printf '\nIMPORTANT: user %s was added to the myst group. Log out of your desktop session and log back in before launching the GUI.\n' "$SUDO_USER"
-printf 'Launch from the application menu, or run: /usr/local/bin/myst-gui\n'
+printf '\nLaunch "Mysterium VPN" from the application menu, or run /usr/local/bin/myst-gui.\n'

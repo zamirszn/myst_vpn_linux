@@ -31,3 +31,4 @@ node_modules/
 /mystd
 /desktop/myst-tray
 /desktop/myst-gui
+/dist/

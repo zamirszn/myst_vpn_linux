@@ -1,0 +1,52 @@
+#!/bin/sh
+# Launcher for the privileged Mysterium VPN daemon.
+#
+# The control socket is the security boundary: the daemon runs as root and acts
+# on anything that can reach it. It is made accessible to one group, and this
+# script decides which group that is.
+#
+# The rule is: the primary group of whoever is using the desktop. Every Ubuntu
+# desktop account already belongs to its own primary group, so the app works
+# immediately after installation without adding anyone to a new group and
+# without a log-out.
+set -eu
+
+SOCKET=/run/mystd/mystd.sock
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+GROUP=""
+
+# An explicit choice written by the installer wins, but only while it still
+# names a real group. A group deleted after installation falls through.
+if [ -r /etc/mysterium-vpn/socket-group ]; then
+	GROUP=$(tr -d '[:space:]' < /etc/mysterium-vpn/socket-group || true)
+	if [ -n "$GROUP" ] && ! getent group "$GROUP" >/dev/null 2>&1; then
+		GROUP=""
+	fi
+fi
+
+if [ -z "$GROUP" ]; then
+	if [ -x "$SELF_DIR/desktop-group" ]; then
+		GROUP=$("$SELF_DIR/desktop-group" 2>/dev/null || true)
+	fi
+fi
+
+if [ -z "$GROUP" ]; then
+	echo "mystd: no desktop user found; refusing to expose the control socket" >&2
+	exit 1
+fi
+
+# The daemon may be in the package's private directory (.deb) or the system path
+# (portable install). Pick whichever exists.
+DAEMON=""
+for candidate in "$SELF_DIR/mystd" /usr/lib/mysterium-vpn/mystd /usr/local/bin/mystd /usr/bin/mystd; do
+	if [ -x "$candidate" ]; then
+		DAEMON=$candidate
+		break
+	fi
+done
+if [ -z "$DAEMON" ]; then
+	echo "mystd: daemon executable not found" >&2
+	exit 1
+fi
+
+exec "$DAEMON" -socket "$SOCKET" -socket-group "$GROUP" "$@"

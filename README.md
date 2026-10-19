@@ -4,23 +4,35 @@ A Linux client for **Mysterium VPN 2.0** — the subscription product, not the
 legacy MYST/dVPN network. A real WireGuard tunnel, a command line, a tray
 applet, a kill switch, and a monitor that repairs the tunnel when it dies.
 
-Works on Ubuntu 24.04 against a live account. Version 0.1.0.
+Works on Ubuntu 24.04 against a live account. Version 1.0.0.
 
 ---
 
 ## Install
 
+Build the package, then copy the `.deb` to the Ubuntu PC and **double-click
+it**. Ubuntu opens it in App Center / Software Install; approve the password
+prompt and the app appears in the application menu. No terminal, no group
+changes, and **no log-out**: the service gives its control socket the primary
+group of the person using the desktop, which that person already belongs to.
+
 ```sh
-sudo apt install ./myst-client_0.1.0_amd64.deb
+./build-deb.sh
+# dist/mysterium-vpn_1.0.0_amd64.deb
 ```
 
-Then **log out and back in once**. The installer adds you to the `myst` group,
-which is what lets your user talk to the daemon; until you log back in, every
-command fails with `permission denied` against a daemon that looks perfectly
-healthy.
+`./build-portable-package.sh` additionally produces
+`dist/mysterium-vpn-linux-amd64.zip`, which carries the same `.deb` plus a
+portable `install.sh` for machines where the package manager will not be used.
 
-Not built yet — the `.deb` is part of the remaining work. Until then, see
-[Building from source](#building-from-source).
+The first launch opens a login screen: enter the email address of your
+Mysterium VPN account, click Continue, open the email, then click **Paste** and
+**Log in** in the app. The service keeps the account; the app never stores the
+token itself.
+
+If the app cannot find its service (for example after switching desktop users),
+its main screen offers **Start VPN service**, which asks for the password and
+restarts the daemon with the correct socket group.
 
 ---
 
@@ -189,8 +201,13 @@ is published under a lock that is never held across a network call.
 
 ## Troubleshooting
 
-**`permission denied` talking to the daemon.** Your session does not carry the
-`myst` group yet. Log out and back in. Check with `id -nG`.
+**`permission denied` talking to the daemon.** The socket's group does not
+match the user at the desktop. This happens after switching desktop users
+without restarting the service. Click **Start VPN service** in the app (or run
+`sudo systemctl restart mystd`); the launcher re-reads the active user's primary
+group on every start. Check the socket with `ls -l /run/mystd/mystd.sock` and
+the launcher's choice with
+`sudo /usr/lib/mysterium-vpn/desktop-group`.
 
 **The daemon will not start after you edited the unit.** Almost always a stale
 binary. The unit file and the binary are installed independently, so it is
@@ -402,28 +419,24 @@ Check it before installing anything:
 
 ### Install
 
-```sh
-sudo install -m755 mystd myst myst-tray /usr/local/bin/
-sudo install -m755 desktop/myst-gui      /usr/local/bin/
-sudo install -m644 deploy/mystd.service  /etc/systemd/system/
-sudo install -m644 desktop/myst-gui.desktop /usr/share/applications/
+The supported path is the package, because it is the one that needs no
+terminal on the target machine:
 
-sudo groupadd --system myst
-sudo usermod -aG myst "$USER"
-sudo sed -i 's|^ExecStart=/usr/local/bin/mystd$|ExecStart=/usr/local/bin/mystd -socket-group myst|' \
-    /etc/systemd/system/mystd.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now mystd
+```sh
+./build-deb.sh                       # dist/mysterium-vpn_1.0.0_amd64.deb
+./build-portable-package.sh          # also writes the zip with install.sh
 ```
 
-The `sed` is the piece that is easy to get wrong, and it fails quietly: without
-it the daemon opens its socket `root:root`, and every front end reports
-"permission denied" while `systemctl status` says the daemon is fine. The .deb
-in Part 3 of the packaging work bakes the flag into the unit instead.
+The portable installer, for a machine where the `.deb` route is unavailable:
 
-**Log out and back in** before using it — the `myst` group is only picked up by
-a new session. `id -nG` should list `myst`; if it does not, nothing you run will
-reach the daemon.
+```sh
+sudo ./install.sh
+```
+
+It installs the daemon, the launcher wrapper and the desktop entry under
+`/usr/local`, and starts `mystd.service`. The wrapper gives the control socket
+the desktop user's primary group, so **no log-out is needed** — unlike the old
+`usermod -aG myst` instructions, which only took effect in a new session.
 
 Then verify, in this order:
 
@@ -503,6 +516,13 @@ startup failure, not a silent fallback to root-only — a typo should not look l
 a working daemon.
 
 `mystd` logs which of the two it is doing at startup.
+
+The installed service does not hard-code a group. Its launcher
+(`/usr/lib/mysterium-vpn/mystd-launch`, or `/usr/local/lib/...` for the
+portable install) reads the active x11/wayland session's user and passes that
+user's primary group, which they already belong to. That is what removes the
+log-out step from installation. An administrator can override the choice by
+writing a group name to `/etc/mysterium-vpn/socket-group`.
 
 ---
 

@@ -1,0 +1,11 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: mysterium-linux-client
+Source: https://github.com/zamirszn/myst_vpn_linux
+
+Files: *
+Copyright: 2026 Mubarak Lawal
+License: proprietary
+ This package was built from a private source tree. All rights reserved.
+ No permission is granted to copy, modify or redistribute it except as
+ part of installing and using the application on systems owned or
+ administered by the copyright holder.

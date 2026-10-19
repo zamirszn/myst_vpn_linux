@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"strings"
 	"sync/atomic"
@@ -28,22 +27,22 @@ const opTimeout = 3 * time.Minute
 
 // fastestLabel is the region picker's first entry. It sends no country at all,
 // which asks the API to choose the best node.
-const fastestLabel = "Fastest (recommended)"
+const fastestLabel = "Fastest location"
 
 // fallbackNote is shown while the picker is on the built-in list rather than
 // the account's own. It names the likely cause, because the likely cause is a
 // daemon older than this window, and that is not something the window can fix
 // by trying harder.
-const fallbackNote = `<span foreground="#a9a7c2" size="small">Common regions only — ` +
-	`the daemon could not list them all. If mystd is up to date, either the ` +
-	`list is still loading or the daemon is not answering.</span>`
+const fallbackNote = `<span foreground="#a79fbe" size="small">Common regions only — ` +
+	`the full location list is still loading. If this does not change, restart the VPN service.</span>`
 
 type window struct {
 	app    *gtk.Application
 	client daemonclient.Client
+	socket string
 
 	win     *gtk.ApplicationWindow
-	banner  *gtk.Label // the green bar across the top while connected
+	banner  *gtk.Label // the green/amber/red strip at the top of the main screen
 	heading *gtk.Label
 	detail  *gtk.Label
 	action  *gtk.Button
@@ -53,11 +52,20 @@ type window struct {
 	search  *gtk.SearchEntry
 	results *gtk.ListBox
 	note    *gtk.Label
-	exitIP  *gtk.Label
-	copy    *gtk.Button
 	iface   *gtk.Label
 	ipv6    *gtk.Label
 	ks      *gtk.Label
+
+	// The lavender card over the map: where the tunnel goes and the one
+	// button that acts on it.
+	statusCard   *gtk.Box
+	statusVisual *statusVisual
+	locFlag      *gtk.Label
+	locName      *gtk.Label
+	locMeta      *gtk.Label
+	exitLine     *gtk.Label
+	copy         *gtk.Button
+	repair       *gtk.Button
 
 	// The window has two screens, and the daemon's answer to "is anyone signed
 	// in?" chooses between them. See login.go.
@@ -155,10 +163,11 @@ type window struct {
 // rather than growing the window.
 const searchLimit = 6
 
-func newWindow(app *gtk.Application, client daemonclient.Client) *window {
+func newWindow(app *gtk.Application, client daemonclient.Client, socket string) *window {
 	w := &window{
 		app:           app,
 		client:        client,
+		socket:        socket,
 		placesByType:  map[string][]regions.Place{},
 		loadingPlaces: map[string]bool{},
 	}
@@ -169,15 +178,18 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 
 	w.win = gtk.NewApplicationWindow(app)
 	w.win.SetTitle("Mysterium VPN")
-	// A tall, narrow column, like the official app's location panel.
-	w.win.SetDefaultSize(420, 720)
+	// A tall column, like the official app's connection screen.
+	w.win.SetDefaultSize(460, 820)
 
-	// Hidden until there is a tunnel (or one is being built) to report.
+	// Hidden until there is a tunnel (or one is being built) to report. The
+	// main screen reuses it for the red "disconnected" strip.
 	w.banner = gtk.NewLabel("")
-	w.banner.AddCSSClass("connected-banner")
+	w.banner.AddCSSClass("status-strip")
+	w.banner.SetHExpand(true)
+	w.banner.SetHAlign(gtk.AlignFill)
 	w.banner.SetVisible(false)
 
-	w.heading = gtk.NewLabel("…")
+	w.heading = gtk.NewLabel("")
 	w.heading.SetMarkup("<b>Checking…</b>")
 	w.heading.SetHAlign(gtk.AlignStart)
 	w.heading.AddCSSClass("status-heading")
@@ -203,9 +215,9 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	// own and about five times longer, replaces it as soon as it arrives.
 	w.choices = regions.All
 
-	// Which pool of IPs to exit through, as tabs. The pages are empty: the
-	// pickers below are shared, and switching tab swaps their lists for that
-	// pool's own.
+	// Which pool of IPs to exit through, as a segmented control. The pages are
+	// empty: the pickers below are shared, and switching tab swaps their lists
+	// for that pool's own.
 	w.ipType = gtk.NewNotebook()
 	w.ipType.SetShowBorder(false)
 	for _, label := range ipTypeLabels() {
@@ -220,23 +232,27 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	})
 
 	w.region = gtk.NewDropDownFromStrings(w.pickerLabels())
+	w.region.SetHExpand(true)
 	w.region.NotifyProperty("selected", func() {
 		w.refreshCityPicker()
 		w.applyCitySensitivity()
+		w.refreshLocationCard()
 	})
 
 	// "Any city" is the only entry until a country with cities is picked.
 	w.city = gtk.NewDropDownFromStrings([]string{"Any city"})
+	w.city.SetHExpand(true)
 	w.city.SetSensitive(false)
 	w.city.NotifyProperty("selected", func() {
 		cities := regions.CitiesOf(w.places, w.selectedRegion())
 		w.cityChoice = regions.CitySlugAt(cities, int(w.city.Selected()))
+		w.refreshLocationCard()
 	})
 
 	// Search across every country's cities. Picking a hit sets both dropdowns,
 	// so the connect path is unchanged: it still reads them.
 	w.search = gtk.NewSearchEntry()
-	w.search.SetObjectProperty("placeholder-text", "Search for locations")
+	w.search.SetObjectProperty("placeholder-text", "Search locations")
 	w.search.SetSensitive(false) // until the daemon's city list arrives
 	w.search.ConnectSearchChanged(func() { w.showSearchResults() })
 
@@ -254,52 +270,34 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	})
 
 	// Says so when the picker is on the built-in fallback rather than the
-	// account's real list. Without it the two are indistinguishable, and a
-	// daemon too old to answer "countries" — which is exactly what an
-	// un-upgraded mystd is — looks like a client that only knows eighteen
-	// countries.
+	// account's real list.
 	w.note = gtk.NewLabel("")
 	w.note.SetWrap(true)
 	w.note.SetHAlign(gtk.AlignStart)
 	w.note.SetMarkup(fallbackNote)
 
-	w.copy = gtk.NewButtonWithLabel("Copy")
-	w.copy.AddCSSClass("chip")
-	w.copy.ConnectClicked(func() { w.copyExitIP() })
+	// The animated panel and the connection card that floats over its lower
+	// edge. The overlay is what makes the card read as part of the map, the way
+	// the official app's location sheet does.
+	w.statusVisual = newStatusVisual()
+	w.statusCard = w.buildStatusCard()
 
-	// Brand bar: the wordmark, weighted the way the official logo is — heavy
-	// MYSTERIUM, light VPN.
-	brand := gtk.NewLabel("")
-	brand.SetMarkup(`<span weight="heavy">MYSTERIUM</span><span weight="light">VPN</span>`)
-	brand.AddCSSClass("brand")
-	brand.SetHAlign(gtk.AlignStart)
-	brand.SetHExpand(true)
-
-	// The wordmark on the left; who is signed in, and the way out, on the right.
-	// The account half is hidden until the daemon says someone is.
-	topbar := gtk.NewBox(gtk.OrientationHorizontal, 8)
-	topbar.SetMarginTop(18)
-	topbar.SetMarginBottom(6)
-	topbar.SetMarginStart(20)
-	topbar.SetMarginEnd(20)
-	topbar.Append(brand)
-	topbar.Append(w.buildAccountBar())
-	w.accountBar.SetVisible(false)
-
-	// The status and the one button that acts on it share a card, so the
-	// button reads as belonging to the state above it.
-	statusCard := gtk.NewBox(gtk.OrientationVertical, 6)
-	statusCard.AddCSSClass("card")
-	statusCard.Append(w.heading)
-	statusCard.Append(w.detail)
-	statusCard.Append(w.action)
+	panel := gtk.NewOverlay()
+	panel.SetChild(w.statusVisual.area)
+	panel.AddOverlay(w.statusCard)
+	panel.SetVExpand(true)
+	w.statusCard.SetHAlign(gtk.AlignFill)
+	w.statusCard.SetVAlign(gtk.AlignEnd)
+	w.statusCard.SetMarginStart(12)
+	w.statusCard.SetMarginEnd(12)
+	w.statusCard.SetMarginBottom(12)
 
 	// Everything that chooses where to connect goes under one title.
-	locationTitle := gtk.NewLabel("Select location")
+	locationTitle := gtk.NewLabel("SELECT LOCATION")
 	locationTitle.AddCSSClass("section-title")
 	locationTitle.SetHAlign(gtk.AlignStart)
 
-	detailsTitle := gtk.NewLabel("Connection details")
+	detailsTitle := gtk.NewLabel("CONNECTION DETAILS")
 	detailsTitle.AddCSSClass("section-title")
 	detailsTitle.SetHAlign(gtk.AlignStart)
 
@@ -308,15 +306,15 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	detailsCard.Append(w.details())
 
 	body := gtk.NewBox(gtk.OrientationVertical, 12)
-	body.SetMarginTop(8)
+	body.SetMarginTop(14)
 	body.SetMarginBottom(20)
-	body.SetMarginStart(20)
-	body.SetMarginEnd(20)
+	body.SetMarginStart(18)
+	body.SetMarginEnd(18)
 
-	body.Append(statusCard)
-	body.Append(locationTitle)
 	body.Append(w.search)
 	body.Append(w.results)
+	body.Append(panel)
+	body.Append(locationTitle)
 	body.Append(w.ipType)
 	body.Append(w.region)
 	body.Append(w.city)
@@ -331,18 +329,21 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 	scroller.SetVExpand(true)
 	scroller.SetChild(body)
 
+	mainScreen := gtk.NewBox(gtk.OrientationVertical, 0)
+	mainScreen.Append(w.banner)
+	mainScreen.Append(scroller)
+
 	// Which of the two is showing is the daemon's call, made in apply. It opens
 	// on the login screen while the first status request is pending. A current
 	// daemon switches to the correct screen as soon as its status arrives.
 	w.screens = gtk.NewStack()
 	w.screens.SetVExpand(true)
-	w.screens.AddNamed(scroller, "main")
+	w.screens.AddNamed(mainScreen, "main")
 	w.screens.AddNamed(w.buildLogin(), "login")
 	w.screens.SetVisibleChildName("login")
 
 	root := gtk.NewBox(gtk.OrientationVertical, 0)
-	root.Append(w.banner)
-	root.Append(topbar)
+	root.Append(w.buildHeader())
 	root.Append(w.screens)
 
 	w.win.SetChild(root)
@@ -356,18 +357,120 @@ func newWindow(app *gtk.Application, client daemonclient.Client) *window {
 		w.loadPlaces()
 		return true // keep the timer running
 	})
+	// The map's pulse runs on its own faster clock; tick is a no-op unless a
+	// tunnel is actually being built.
+	glib.TimeoutAdd(60, func() bool {
+		w.statusVisual.tick()
+		return true
+	})
 
 	return w
 }
 
-// details builds the read-only rows: the exit IP with its copy action, and the
-// three indicators worth being able to check at a glance.
+// buildHeader is the top bar: the Mysterium mark and wordmark on the left, the
+// signed-in account and sign-out action on the right.
+func (w *window) buildHeader() *gtk.Box {
+	header := gtk.NewBox(gtk.OrientationHorizontal, 11)
+	header.AddCSSClass("header")
+
+	if img := logoImage(26); img != nil {
+		img.SetVAlign(gtk.AlignCenter)
+		header.Append(img)
+	}
+
+	strong := gtk.NewLabel("MYSTERIUM")
+	strong.AddCSSClass("brand-strong")
+	light := gtk.NewLabel("VPN")
+	light.AddCSSClass("brand-light")
+
+	word := gtk.NewBox(gtk.OrientationHorizontal, 2)
+	word.Append(strong)
+	word.Append(light)
+
+	sub := gtk.NewLabel("PRIVATE · FAST · GLOBAL")
+	sub.AddCSSClass("brand-sub")
+	sub.SetHAlign(gtk.AlignStart)
+
+	brand := gtk.NewBox(gtk.OrientationVertical, 0)
+	brand.Append(word)
+	brand.Append(sub)
+	brand.SetVAlign(gtk.AlignCenter)
+	brand.SetHExpand(true)
+
+	header.Append(brand)
+	header.Append(w.buildAccountBar())
+	w.accountBar.SetVisible(false)
+	return header
+}
+
+// buildStatusCard is the lavender sheet: state, location, exit address and the
+// one button that acts on the tunnel.
+func (w *window) buildStatusCard() *gtk.Box {
+	card := gtk.NewBox(gtk.OrientationVertical, 8)
+	card.AddCSSClass("status-card")
+	card.SetHExpand(true)
+
+	card.Append(w.heading)
+	card.Append(w.detail)
+
+	w.locFlag = gtk.NewLabel("\U0001F310")
+	w.locFlag.AddCSSClass("flag")
+	w.locFlag.SetVAlign(gtk.AlignCenter)
+
+	w.locName = gtk.NewLabel(fastestLabel)
+	w.locName.AddCSSClass("location-name")
+	w.locName.SetHAlign(gtk.AlignStart)
+
+	w.locMeta = gtk.NewLabel("Automatic")
+	w.locMeta.AddCSSClass("location-meta")
+	w.locMeta.SetHAlign(gtk.AlignStart)
+
+	info := gtk.NewBox(gtk.OrientationVertical, 0)
+	info.SetHExpand(true)
+	info.Append(w.locName)
+	info.Append(w.locMeta)
+
+	location := gtk.NewBox(gtk.OrientationHorizontal, 10)
+	location.SetMarginTop(2)
+	location.Append(w.locFlag)
+	location.Append(info)
+
+	card.Append(location)
+
+	w.exitLine = gtk.NewLabel("Not connected")
+	w.exitLine.AddCSSClass("exit-ip")
+	w.exitLine.SetHAlign(gtk.AlignStart)
+	w.exitLine.SetHExpand(true)
+
+	w.copy = gtk.NewButtonWithLabel("Copy IP")
+	w.copy.AddCSSClass("chip")
+	w.copy.ConnectClicked(func() { w.copyExitIP() })
+
+	exitRow := gtk.NewBox(gtk.OrientationHorizontal, 8)
+	exitRow.Append(w.exitLine)
+	exitRow.Append(w.copy)
+	card.Append(exitRow)
+
+	// Shown only when the daemon could not be reached. Without it the window is
+	// a dead end: the person is told the service is not running and has no way
+	// to start it without opening a terminal.
+	w.repair = gtk.NewButtonWithLabel("Start VPN service")
+	w.repair.AddCSSClass("chip")
+	w.repair.SetVisible(false)
+	w.repair.ConnectClicked(func() { w.startDaemon() })
+	card.Append(w.repair)
+
+	card.Append(w.action)
+	return card
+}
+
+// details builds the read-only rows: the three indicators worth being able to
+// check at a glance.
 func (w *window) details() *gtk.Widget {
 	grid := gtk.NewGrid()
 	grid.SetRowSpacing(8)
 	grid.SetColumnSpacing(16)
 
-	w.exitIP = gtk.NewLabel("—")
 	w.iface = gtk.NewLabel("—")
 	w.ipv6 = gtk.NewLabel("—")
 	w.ks = gtk.NewLabel("—")
@@ -376,7 +479,6 @@ func (w *window) details() *gtk.Widget {
 		key   string
 		value *gtk.Label
 	}{
-		{"Exit IP", w.exitIP},
 		{"Interface", w.iface},
 		{"IPv6", w.ipv6},
 		{"Kill switch", w.ks},
@@ -390,41 +492,37 @@ func (w *window) details() *gtk.Widget {
 
 		row.value.SetHAlign(gtk.AlignStart)
 		row.value.SetSelectable(true)
+		row.value.AddCSSClass("detail-value")
 
 		grid.Attach(key, 0, i, 1, 1)
 		grid.Attach(row.value, 1, i, 1, 1)
 	}
-
-	// The copy button sits beside the IP it copies rather than in a row of its
-	// own, so there is no doubt about what it acts on.
-	w.copy.SetHAlign(gtk.AlignEnd)
-	grid.Attach(w.copy, 2, 0, 1, 1)
 
 	return &grid.Widget
 }
 
 func (w *window) present() { w.win.Present() }
 
-// setBanner shows the bar across the top with text, or hides it when text is
-// empty. pending turns it amber, for a tunnel that is on its way up or being
-// repaired rather than up.
-func (w *window) setBanner(text string, pending bool) {
+// setBanner shows the strip across the top with text and one of the four state
+// classes: connected, connecting, error, offline. An empty text hides it.
+func (w *window) setBanner(text, kind string) {
+	for _, class := range []string{"connecting", "error", "offline"} {
+		w.banner.RemoveCSSClass(class)
+	}
 	if text == "" {
 		w.banner.SetVisible(false)
 		return
 	}
-	w.banner.SetText(text)
-	if pending {
-		w.banner.AddCSSClass("connecting")
-	} else {
-		w.banner.RemoveCSSClass("connecting")
+	if kind != "" {
+		w.banner.AddCSSClass(kind)
 	}
+	w.banner.SetText(text)
 	w.banner.SetVisible(true)
 }
 
 // styleAction gives the one button its look for the state it is in: the accent
-// colour for Connect, a quiet grey for Disconnect — so the destructive action
-// is never the most inviting thing in the window.
+// gradient for Connect, a clean white for Disconnect — so the destructive
+// action is never the most inviting thing in the card.
 func (w *window) styleAction(connected bool) {
 	if connected {
 		w.action.RemoveCSSClass("connect-btn")
@@ -462,11 +560,11 @@ func (w *window) poll() {
 		w.onMain(func() {
 			if err != nil {
 				w.showUnreachable(err)
-				// Keep the login form visible while the daemon is unavailable,
-				// and explain why requesting a link cannot work yet.
-				w.screens.SetVisibleChildName("login")
+				// Stay on the main screen even mid-outage: the status card
+				// carries the explanation and the button that starts the
+				// service, which the login card has no room for.
+				w.screens.SetVisibleChildName("main")
 				w.accountBar.SetVisible(false)
-				w.loginFail(w.login.emailErr, "Cannot reach the Mysterium daemon. Start or update mystd, then try again. "+err.Error())
 				return
 			}
 			if w.generation.Load() != gen {
@@ -517,6 +615,51 @@ func (w *window) selectedCity() string {
 		return ""
 	}
 	return regions.CitySlugAt(cities, int(w.city.Selected()))
+}
+
+// selectedCityName is the readable name of the city row, for the card.
+func (w *window) selectedCityName() string {
+	cities := regions.CitiesOf(w.places, w.selectedRegion())
+	row := int(w.city.Selected())
+	if row <= 0 || row > len(cities) {
+		return ""
+	}
+	return cities[row-1].Name
+}
+
+// countryName prefers the name the account's own location list gave, which
+// covers countries the built-in table does not know, then falls back to the
+// table and finally to the raw code.
+func (w *window) countryName(code string) string {
+	for _, r := range w.choices {
+		if strings.EqualFold(r.Code, code) {
+			return r.Name
+		}
+	}
+	return regions.Name(code)
+}
+
+// refreshLocationCard paints the card from the pickers, for the states where
+// there is no live tunnel to report. When connected, apply writes the live
+// values instead.
+func (w *window) refreshLocationCard() {	if w.onScreen().State == daemonclient.StateConnected {
+		return
+	}
+	code := w.selectedRegion()
+	w.locFlag.SetText(flagEmoji(code))
+	if code == "" {
+		w.locName.SetText(fastestLabel)
+	} else {
+		w.locName.SetText(w.countryName(code))
+	}
+	meta := []string{}
+	if city := w.selectedCityName(); city != "" {
+		meta = append(meta, city)
+	}
+	meta = append(meta, ipTypeLabel(w.selectedIPType()))
+	w.locMeta.SetText(strings.Join(meta, " · "))
+	w.exitLine.SetText("Not connected")
+	w.copy.SetSensitive(false)
 }
 
 // refreshCityPicker rebuilds the city dropdown's list for whatever country the
@@ -593,12 +736,12 @@ func (w *window) showSearchResults() {
 	w.matches = regions.SearchCities(w.places, w.search.Text(), searchLimit)
 
 	for _, m := range w.matches {
-		label := gtk.NewLabel(m.Label())
+		label := gtk.NewLabel(flagEmoji(m.Code) + "  " + m.Label())
 		label.SetHAlign(gtk.AlignStart)
-		label.SetMarginTop(6)
-		label.SetMarginBottom(6)
-		label.SetMarginStart(10)
-		label.SetMarginEnd(10)
+		label.SetMarginTop(7)
+		label.SetMarginBottom(7)
+		label.SetMarginStart(12)
+		label.SetMarginEnd(12)
 		w.results.Append(label)
 	}
 	w.results.SetVisible(len(w.matches) > 0)
@@ -621,6 +764,7 @@ func (w *window) pickSearchResult(m regions.CityMatch) {
 	w.region.SetSelected(row) // if the row changes, its handler rebuilds the cities
 	w.refreshCityPicker()     // and if it did not, this does
 	w.applyCitySensitivity()
+	w.refreshLocationCard()
 	w.clearSearch()
 }
 
@@ -684,6 +828,7 @@ func (w *window) showPlaces(list []regions.Place) {
 	w.fillRegions(regions.Regions(list))
 	w.refreshCityPicker()
 	w.applyCitySensitivity()
+	w.refreshLocationCard()
 }
 
 // onIPTypeChanged swaps the country and city lists for the newly selected
@@ -699,6 +844,7 @@ func (w *window) onIPTypeChanged() {
 	w.places = nil
 	w.refreshCityPicker()
 	w.applyCitySensitivity()
+	w.refreshLocationCard()
 	w.loadPlaces()
 }
 
@@ -713,11 +859,12 @@ func (w *window) selectIPType(value string) {
 	}
 }
 
-// ipTypes are the tabs. Values are what the API takes: it calls the
-// data centre pool "hosting".
+// ipTypes are the tabs. Values are what the API takes: it calls the data centre
+// pool "hosting", while the app offers it as the high-speed pool, which is what
+// it is for.
 var ipTypes = []struct{ Value, Label string }{
 	{"residential", "Residential"},
-	{"hosting", "Data center"},
+	{"hosting", "High-speed"},
 }
 
 func ipTypeLabels() []string {
@@ -780,12 +927,13 @@ func (w *window) fillRegions(list []regions.Region) {
 	w.note.SetVisible(false)
 }
 
-// pickerLabels is the dropdown's row labels: "Fastest", then the country names.
+// pickerLabels is the dropdown's row labels: "Fastest", then the country names
+// with their flags.
 func (w *window) pickerLabels() []string {
 	names := make([]string, 0, len(w.choices)+1)
-	names = append(names, fastestLabel)
+	names = append(names, "\U0001F310  "+fastestLabel)
 	for _, r := range w.choices {
-		names = append(names, r.Name)
+		names = append(names, flagEmoji(r.Code)+"  "+r.Name)
 	}
 	return names
 }
@@ -873,7 +1021,9 @@ func (w *window) apply(st daemonclient.Status) {
 		// screen.
 		w.screens.SetVisibleChildName("login")
 		w.accountBar.SetVisible(false)
-		w.setBanner("", false)
+		w.repair.SetVisible(false)
+		w.setBanner("", "")
+		w.statusVisual.setState("disconnected")
 		if !wasOut {
 			w.onAccountChanged()
 			w.showLoginEmail()
@@ -896,23 +1046,34 @@ func (w *window) apply(st daemonclient.Status) {
 		w.account.SetText("Signed in")
 	}
 
+	w.repair.SetVisible(false)
+
 	switch st.State {
 	case daemonclient.StateConnected:
 		w.heading.SetMarkup("<b>Connected</b>")
 		w.detail.SetText(w.regionLine(st))
-		w.setBanner("Connected", false)
+		w.setBanner("●  Connected", "connected")
+		w.statusVisual.setState(daemonclient.StateConnected)
 	case daemonclient.StateConnecting:
 		w.heading.SetMarkup("<b>Connecting…</b>")
 		w.detail.SetText("Bringing the tunnel up. This can take a moment.")
-		w.setBanner("Connecting…", true)
+		w.setBanner("●  Connecting…", "connecting")
+		w.statusVisual.setState(daemonclient.StateConnecting)
 	case daemonclient.StateReconnecting:
 		w.heading.SetMarkup("<b>Reconnecting…</b>")
 		w.detail.SetText(w.reconnectLine(st))
-		w.setBanner("Reconnecting…", true)
-	default:
-		w.heading.SetMarkup("<b>Not connected</b>")
+		w.setBanner("●  Reconnecting…", "connecting")
+		w.statusVisual.setState(daemonclient.StateReconnecting)
+	case daemonclient.StateError:
+		w.heading.SetMarkup("<b>Connection failed</b>")
 		w.detail.SetText(w.idleLine(st))
-		w.setBanner("", false)
+		w.setBanner("●  Disconnected", "error")
+		w.statusVisual.setState(daemonclient.StateError)
+	default:
+		w.heading.SetMarkup("<b>Disconnected</b>")
+		w.detail.SetText(w.idleLine(st))
+		w.setBanner("●  Disconnected", "error")
+		w.statusVisual.setState(daemonclient.StateDisconnected)
 	}
 	if w.notice != "" {
 		w.detail.SetText(w.notice)
@@ -956,11 +1117,34 @@ func (w *window) apply(st daemonclient.Status) {
 		// selects within.
 		w.selectIPType(st.IPType)
 		w.selectRegion(st.Country)
+
+		// The card shows the live tunnel, not the picker's intent.
+		w.locFlag.SetText(flagEmoji(st.Country))
+		if st.Country == "" {
+			w.locName.SetText("Connected")
+		} else {
+			w.locName.SetText(w.countryName(st.Country))
+		}
+		meta := []string{}
+		if st.City != "" {
+			meta = append(meta, regions.CityName(w.places, st.Country, st.City))
+		}
+		if st.IPType != "" {
+			meta = append(meta, ipTypeLabel(st.IPType))
+		}
+		w.locMeta.SetText(strings.Join(meta, " · "))
+		if st.ExitIP != "" {
+			w.exitLine.SetText("Exit IP  " + st.ExitIP)
+			w.copy.SetSensitive(true)
+		} else {
+			w.exitLine.SetText("Exit IP  —")
+			w.copy.SetSensitive(false)
+		}
+	} else {
+		w.refreshLocationCard()
 	}
 	w.applyCitySensitivity()
 
-	w.exitIP.SetText(orDash(st.ExitIP))
-	w.copy.SetSensitive(st.State == daemonclient.StateConnected && st.ExitIP != "")
 	w.iface.SetText(orDash(st.Interface))
 
 	if st.State != daemonclient.StateConnected {
@@ -1013,6 +1197,7 @@ func (w *window) loadCountries() {
 				return // the selected type's own list is already on screen
 			}
 			w.fillRegions(list)
+			w.refreshLocationCard()
 		})
 	}()
 }
@@ -1020,17 +1205,53 @@ func (w *window) loadCountries() {
 // showUnreachable is for a daemon that did not answer at all, which is a
 // different problem from a daemon that answered with a failure.
 func (w *window) showUnreachable(err error) {
-	w.action.SetSensitive(true)
+	w.action.SetSensitive(false)
 	w.action.SetLabel("Connect")
 	w.styleAction(false)
-	w.setBanner("", false)
-	w.heading.SetMarkup("<b>Cannot reach the daemon</b>")
-	w.detail.SetText(fmt.Sprintf("%v\n\nIs mystd running?  systemctl status mystd", err))
-	w.exitIP.SetText("—")
+	w.setBanner("●  VPN service offline", "offline")
+	w.statusVisual.setState("error")
+	w.heading.SetMarkup("<b>VPN service is not running</b>")
+	w.detail.SetText("Start the service below, then try again.\n\n" + err.Error())
 	w.iface.SetText("—")
 	w.ipv6.SetText("—")
 	w.ks.SetText("—")
+	w.exitLine.SetText("Not connected")
 	w.copy.SetSensitive(false)
+	w.locFlag.SetText("\U0001F310")
+	w.locName.SetText("No location yet")
+	w.locMeta.SetText("Start the service to choose a location")
+	w.repair.SetVisible(true)
+	w.region.SetSensitive(false)
+	w.city.SetSensitive(false)
+	w.ipType.SetSensitive(false)
+	w.search.SetSensitive(false)
+}
+
+// startDaemon asks the service manager (or, when there is no service, pkexec)
+// to bring the privileged daemon up, then resumes polling. It is the graphical
+// equivalent of "sudo systemctl start mystd" for someone who should not have to
+// know that command.
+func (w *window) startDaemon() {
+	if !w.busy.CompareAndSwap(false, true) {
+		return
+	}
+	w.repair.SetSensitive(false)
+	w.repair.SetLabel("Starting…")
+
+	go func() {
+		err := ensureDaemon(w.socket)
+		w.onMain(func() {
+			w.busy.Store(false)
+			w.repair.SetSensitive(true)
+			w.repair.SetLabel("Start VPN service")
+			if err != nil {
+				w.heading.SetMarkup("<b>Could not start the VPN service</b>")
+				w.detail.SetText(err.Error())
+				return
+			}
+			w.poll()
+		})
+	}()
 }
 
 // copyExitIP puts the exit IP on the clipboard.
@@ -1047,7 +1268,7 @@ func (w *window) copyExitIP() {
 
 	w.copy.SetLabel("Copied")
 	glib.TimeoutAdd(1500, func() bool {
-		w.copy.SetLabel("Copy")
+		w.copy.SetLabel("Copy IP")
 		return false // one shot, not a repeating timer
 	})
 }
@@ -1060,7 +1281,7 @@ func (w *window) regionLine(st daemonclient.Status) string {
 	if st.IPType != "" {
 		name += " · " + ipTypeLabel(st.IPType)
 	}
-	return name
+	return "Your traffic is encrypted through " + name + "."
 }
 
 func (w *window) reconnectLine(st daemonclient.Status) string {
@@ -1077,7 +1298,7 @@ func (w *window) idleLine(st daemonclient.Status) string {
 	if st.LastError != "" {
 		return st.LastError
 	}
-	return "Your traffic is going out directly."
+	return "Your traffic is going out directly. Choose a location and connect."
 }
 
 func orDash(s string) string {

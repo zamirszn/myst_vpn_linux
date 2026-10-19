@@ -1,0 +1,17 @@
+Package: mysterium-vpn
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: @ARCH@
+Installed-Size: @SIZE@
+Maintainer: Mubarak Lawal <mubaraklawal52@gmail.com>
+Homepage: https://github.com/zamirszn/myst_vpn_linux
+Depends: libc6 (>= 2.34), libgtk-4-1, systemd, wireguard-tools, nftables, iproute2, ca-certificates, pkexec | policykit-1
+Description: Mysterium VPN desktop application
+ A native GTK 4 client for Mysterium VPN with a real WireGuard tunnel,
+ a kill switch, and automatic reconnection.
+ .
+ Installing this package adds Mysterium VPN to the application menu. The
+ privileged daemon is started at boot and its control socket is given the
+ primary group of the desktop user, so no terminal commands, group changes,
+ or log-out are required after installation.

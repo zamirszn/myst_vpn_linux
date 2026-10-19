@@ -76,7 +76,7 @@ func ensureDaemon(socket string) error {
 	if err != nil {
 		return fmt.Errorf("find desktop socket group: %w", err)
 	}
-	cmd := exec.Command("pkexec", append([]string{exe, "--daemon", "-socket", socket, "-socket-group", group})...)
+	cmd := exec.Command("pkexec", exe, "--daemon", "-socket", socket, "-socket-group", group)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start privileged daemon: %w", err)
 	}

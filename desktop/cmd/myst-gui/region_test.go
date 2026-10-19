@@ -123,7 +123,7 @@ func TestIPTypeRowAndValueRoundTrip(t *testing.T) {
 			t.Errorf("ipTypeRow(%q) = %d, want %d", value, got, want)
 		}
 	}
-	if got := ipTypeLabel("hosting"); got != "Data center" {
+	if got := ipTypeLabel("hosting"); got != "High-speed" {
 		t.Errorf("ipTypeLabel(hosting) = %q", got)
 	}
 }

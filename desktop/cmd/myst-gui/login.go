@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	gio "github.com/diamondburned/gotk4/pkg/gio/v2"
 	"github.com/diamondburned/gotk4/pkg/glib/v2"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 	"github.com/diamondburned/gotk4/pkg/pango"
@@ -81,7 +82,7 @@ func (w *window) buildLogin() *gtk.Box {
 	l.emailErr.SetVisible(false)
 
 	emailStep := gtk.NewBox(gtk.OrientationVertical, 12)
-	emailStep.AddCSSClass("card")
+	emailStep.AddCSSClass("login-card")
 	emailStep.Append(newText("login-title", "Log in"))
 	emailStep.Append(newText("login-sub",
 		"Enter the email address of your Mysterium VPN account and we'll send you a link to log in."))
@@ -94,7 +95,35 @@ func (w *window) buildLogin() *gtk.Box {
 
 	l.link = gtk.NewEntry()
 	l.link.SetObjectProperty("placeholder-text", "Paste the link from the email")
+	l.link.SetHExpand(true)
 	l.link.ConnectActivate(func() { w.finishLogin() })
+
+	// Right-click paste works in the entry already; this makes the one step
+	// everyone gets stuck on obvious, and tells them when the clipboard is
+	// empty instead of leaving the Log in button to say "paste the link first".
+	paste := gtk.NewButtonWithLabel("Paste")
+	paste.AddCSSClass("chip")
+	paste.ConnectClicked(func() {
+		paste.SetSensitive(false)
+		w.win.Clipboard().ReadTextAsync(context.Background(), func(res gio.AsyncResulter) {
+			text, err := w.win.Clipboard().ReadTextFinish(res)
+			w.onMain(func() {
+				paste.SetSensitive(true)
+				text = strings.TrimSpace(text)
+				if err != nil || text == "" {
+					w.loginFail(l.linkErr, "Your clipboard is empty. Copy the link from the email first.")
+					return
+				}
+				l.link.SetText(text)
+				l.linkErr.SetVisible(false)
+				l.link.GrabFocus()
+			})
+		})
+	})
+
+	entryRow := gtk.NewBox(gtk.OrientationHorizontal, 8)
+	entryRow.Append(l.link)
+	entryRow.Append(paste)
 
 	l.finish = gtk.NewButtonWithLabel("Log in")
 	l.finish.AddCSSClass("connect-btn")
@@ -118,10 +147,10 @@ func (w *window) buildLogin() *gtk.Box {
 	links.Append(l.back)
 
 	linkStep := gtk.NewBox(gtk.OrientationVertical, 12)
-	linkStep.AddCSSClass("card")
+	linkStep.AddCSSClass("login-card")
 	linkStep.Append(newText("login-title", "Check your email"))
 	linkStep.Append(l.sentTo)
-	linkStep.Append(l.link)
+	linkStep.Append(entryRow)
 	linkStep.Append(l.linkErr)
 	linkStep.Append(l.linkNote)
 	linkStep.Append(l.finish)
@@ -422,10 +451,11 @@ func (w *window) onAccountChanged() {
 	w.search.SetSensitive(false)
 	w.results.SetVisible(false)
 	w.copy.SetSensitive(false)
-	w.exitIP.SetText("—")
+	w.exitLine.SetText("Not connected")
 	w.iface.SetText("—")
 	w.ipv6.SetText("—")
 	w.ks.SetText("—")
 	w.refreshCityPicker()
 	w.applyCitySensitivity()
+	w.refreshLocationCard()
 }

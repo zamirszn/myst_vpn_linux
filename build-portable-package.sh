@@ -1,72 +1,49 @@
 #!/usr/bin/env bash
+# Build everything that goes on the other machine: the double-click .deb, and a
+# portable archive for systems where the package manager will not be used.
 set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DIST="$ROOT_DIR/dist"
-STAGE="$DIST/mysterium-linux-amd64"
+VERSION="${VERSION:-1.0.0}"
+ARCH="${ARCH:-$(dpkg --print-architecture)}"
+STAGE="$DIST/mysterium-vpn-linux-${ARCH}"
 
-command -v go >/dev/null || { echo 'ERROR: Go is required to build the package.' >&2; exit 1; }
-command -v pkg-config >/dev/null || { echo 'ERROR: pkg-config is required.' >&2; exit 1; }
-pkg-config --exists gtk4 || {
-  echo 'ERROR: GTK 4 development files are missing.' >&2
-  echo 'On Ubuntu/Debian install them with: sudo apt update && sudo apt install -y build-essential pkg-config libgtk-4-dev policykit-1 zip' >&2
-  exit 1
-}
+# Builds dist/bin/{mystd,myst-gui} and dist/mysterium-vpn_<version>_<arch>.deb.
+VERSION="$VERSION" ARCH="$ARCH" "$ROOT_DIR/build-deb.sh"
 
 rm -rf "$STAGE"
-mkdir -p "$STAGE"
-export CGO_ENABLED=1
-
-printf '\n==> Building daemon from this source tree\n'
-(cd "$ROOT_DIR" && go build -buildvcs=false -trimpath -o "$STAGE/mystd" ./cmd/mystd)
-printf '\n==> Building GTK GUI from the matching desktop module\n'
-(cd "$ROOT_DIR/desktop" && go build -buildvcs=false -trimpath -o "$STAGE/myst-gui" ./cmd/myst-gui)
-
-install -m 0644 "$ROOT_DIR/packaging/mystd.service" "$STAGE/mystd.service"
-install -m 0644 "$ROOT_DIR/packaging/mysterium-vpn.desktop" "$STAGE/mysterium-vpn.desktop"
+mkdir -p "$STAGE/icons"
+install -m 0755 "$DIST/bin/mystd" "$STAGE/mystd"
+install -m 0755 "$DIST/bin/myst-gui" "$STAGE/myst-gui"
+install -m 0755 "$ROOT_DIR/packaging/mystd-launch" "$STAGE/mystd-launch"
+install -m 0755 "$ROOT_DIR/packaging/desktop-group" "$STAGE/desktop-group"
 install -m 0755 "$ROOT_DIR/packaging/install.sh" "$STAGE/install.sh"
 install -m 0755 "$ROOT_DIR/packaging/uninstall.sh" "$STAGE/uninstall.sh"
-cat > "$STAGE/README-INSTALL.txt" <<'DOC'
-MYSTERIUM VPN - PORTABLE UBUNTU PACKAGE
+install -m 0644 "$ROOT_DIR/packaging/mystd.service" "$STAGE/mystd.service"
+install -m 0644 "$ROOT_DIR/packaging/mysterium-vpn.desktop" "$STAGE/mysterium-vpn.desktop"
+install -m 0644 "$ROOT_DIR/packaging/mysterium-vpn.png" "$STAGE/mysterium-vpn.png"
+install -m 0644 "$ROOT_DIR/packaging/README-INSTALL.txt" "$STAGE/README-INSTALL.txt"
+for size in 48 64 128 256 512; do
+  install -m 0644 "$ROOT_DIR/packaging/icons/mysterium-vpn-${size}.png" \
+    "$STAGE/icons/mysterium-vpn-${size}.png"
+done
 
-This package contains both the GUI (myst-gui) and the matching daemon (mystd)
-built from the same source tree. It is an amd64 Linux package, not a universal
-Linux binary. Use on Ubuntu/Debian x86_64 with GTK 4 and systemd.
+# The recommended, terminal-free installer travels in the same archive.
+cp "$DIST/mysterium-vpn_${VERSION}_${ARCH}.deb" "$STAGE/"
 
-INSTALL
-  1. Extract the archive.
-  2. Open a terminal in the extracted folder.
-  3. Run: sudo ./install.sh
-  4. Log out of the desktop session and log back in (the installer adds your
-     user to the 'myst' group so the GUI can access the daemon socket).
-  5. Launch Mysterium VPN from the application menu, or run myst-gui.
-
-The installer enables and starts mystd.service and installs both executables.
-The token/account state is stored by the daemon under /var/lib/mystd and is
-not included in this package. Each computer logs in separately via magic link.
-
-UNINSTALL
-  sudo ./uninstall.sh
-
-Uninstall preserves /var/lib/mystd so credentials are not silently deleted.
-To intentionally erase saved credentials, first log out in the app, then
-review /var/lib/mystd before deleting it manually.
-
-BUILD PROVENANCE
-This package was built from one source tree so the GUI and daemon IPC protocol
-match. If installation fails, inspect: sudo journalctl -u mystd -n 100 --no-pager
-DOC
-
-# Verify both artifacts are ELF executables before packaging.
 file "$STAGE/mystd" "$STAGE/myst-gui"
 chmod 0755 "$STAGE/mystd" "$STAGE/myst-gui"
 mkdir -p "$DIST"
-rm -f "$DIST/mysterium-linux-amd64.tar.gz" "$DIST/mysterium-linux-amd64.zip"
-tar -C "$DIST" -czf "$DIST/mysterium-linux-amd64.tar.gz" "mysterium-linux-amd64"
+rm -f "$DIST/mysterium-vpn-linux-${ARCH}.tar.gz" "$DIST/mysterium-vpn-linux-${ARCH}.zip"
+tar -C "$DIST" -czf "$DIST/mysterium-vpn-linux-${ARCH}.tar.gz" "mysterium-vpn-linux-${ARCH}"
 if command -v zip >/dev/null 2>&1; then
-  (cd "$DIST" && zip -qr mysterium-linux-amd64.zip mysterium-linux-amd64)
+  (cd "$DIST" && zip -qr "mysterium-vpn-linux-${ARCH}.zip" "mysterium-vpn-linux-${ARCH}")
 else
   echo 'zip utility is unavailable; created the .tar.gz package only.' >&2
 fi
-printf '\nPackage created:\n  %s\n' "$DIST/mysterium-linux-amd64.tar.gz"
-[[ ! -f "$DIST/mysterium-linux-amd64.zip" ]] || printf '  %s\n' "$DIST/mysterium-linux-amd64.zip"
-printf '\nTransfer the generated archive to the other Ubuntu PC, extract it, then run sudo ./install.sh.\n'
+
+printf '\nCreated:\n'
+printf '  %s\n' "$DIST/mysterium-vpn_${VERSION}_${ARCH}.deb"
+printf '  %s\n' "$DIST/mysterium-vpn-linux-${ARCH}.tar.gz"
+[[ ! -f "$DIST/mysterium-vpn-linux-${ARCH}.zip" ]] || printf '  %s\n' "$DIST/mysterium-vpn-linux-${ARCH}.zip"
+printf '\nSend the .deb to the other Ubuntu PC and double-click it.\n'

@@ -67,7 +67,7 @@ func main() {
 			win.present()
 			return
 		}
-		win = newWindow(app, daemonclient.Client{Path: *socket})
+		win = newWindow(app, daemonclient.Client{Path: *socket}, *socket)
 		win.present()
 	})
 
@@ -76,61 +76,132 @@ func main() {
 }
 
 // ensureDaemon makes the GUI self-contained. If a system service is already
-// running this is a cheap status request. Otherwise the same executable is
-// started in privileged mode through polkit's pkexec helper.
+// running this is a cheap status request.
+//
+// When it is not, an installed package is repaired through its service unit:
+// the unit's launcher re-reads which desktop user is active and gives the
+// socket that user's primary group, so one pkexec prompt fixes the daemon
+// without anyone logging out. A copy that was not installed as a package has no
+// unit, so the same executable is started in privileged mode directly.
 func ensureDaemon(socket string) error {
 	client := daemonclient.Client{Path: socket}
-	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
-	_, err := client.Status(ctx)
-	cancel()
-	if err == nil {
+	if err := probeDaemon(client); err == nil {
 		return nil
 	}
 
 	if _, lookErr := exec.LookPath("pkexec"); lookErr != nil {
-		return fmt.Errorf("daemon is not running and pkexec is unavailable: %w", lookErr)
+		return fmt.Errorf("the VPN service is not running and pkexec is unavailable: %w", lookErr)
+	}
+
+	// The systemd unit is the right way to bring the service back: it runs the
+	// launcher wrapper, which resolves the socket group for whoever is sitting
+	// at the machine rather than for whoever installed the package. Do not fall
+	// through to a direct daemon when the unit exists — that would mean a second
+	// password prompt after the first was cancelled, and could leave two daemons
+	// racing for the same socket.
+	if serviceInstalled() {
+		if err := restartService(client); err != nil {
+			log.Printf("restarting the VPN service: %v", err)
+			return err
+		}
+		return nil
 	}
 
 	exe, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("find myst executable: %w", err)
+		return fmt.Errorf("find the Mysterium executable: %w", err)
 	}
 	exe, err = filepath.Abs(exe)
 	if err != nil {
-		return fmt.Errorf("resolve myst executable: %w", err)
+		return fmt.Errorf("resolve the Mysterium executable: %w", err)
 	}
 
 	group, err := currentPrimaryGroup()
 	if err != nil {
-		return fmt.Errorf("find desktop socket group: %w", err)
+		return fmt.Errorf("find the desktop socket group: %w", err)
 	}
 
 	args := []string{exe, "--daemon", "-socket", socket, "-socket-group", group}
 	cmd := exec.Command("pkexec", args...)
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start privileged daemon: %w", err)
+		return fmt.Errorf("start the privileged VPN service: %w", err)
 	}
 
 	// pkexec stays attached to the daemon process, so deliberately do not Wait
 	// here. Poll until the socket is ready, or until authentication/startup has
 	// clearly failed.
-	deadline := time.Now().Add(15 * time.Second)
+	if err := waitForDaemon(client, 15*time.Second); err != nil {
+		return fmt.Errorf("the VPN service did not start: %w", err)
+	}
+	return nil
+}
+
+// restartService restarts an installed mystd through systemd under pkexec and
+// waits for it to answer. The unit may be present but stopped, or it may be
+// running with the wrong socket group after a desktop user change.
+func restartService(client daemonclient.Client) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "pkexec", "systemctl", "restart", "mystd").CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("restart the VPN service: %s", msg)
+	}
+	return waitForDaemon(client, 15*time.Second)
+}
+
+func probeDaemon(client daemonclient.Client) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	_, err := client.Status(ctx)
+	return err
+}
+
+func waitForDaemon(client daemonclient.Client, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
-		_, statusErr := client.Status(ctx)
+		_, err := client.Status(ctx)
 		cancel()
-		if statusErr == nil {
+		if err == nil {
 			return nil
 		}
-		lastErr = statusErr
+		lastErr = err
 		time.Sleep(250 * time.Millisecond)
 	}
-
 	if lastErr == nil {
-		lastErr = err
+		lastErr = errors.New("timed out")
 	}
-	return fmt.Errorf("daemon did not become ready: %w", lastErr)
+	return lastErr
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// serviceInstalled reports whether a mystd systemd unit is present, in either
+// the package location or the portable one. The launcher path is checked too so
+// an installed package whose unit is named differently still takes the service
+// path rather than starting a second daemon directly.
+func serviceInstalled() bool {
+	for _, path := range []string{
+		"/etc/systemd/system/mystd.service",
+		"/usr/lib/systemd/system/mystd.service",
+		"/lib/systemd/system/mystd.service",
+		"/usr/lib/mysterium-vpn/mystd-launch",
+		"/usr/local/lib/mysterium-vpn/mystd-launch",
+	} {
+		if fileExists(path) {
+			return true
+		}
+	}
+	return false
 }
 
 func currentPrimaryGroup() (string, error) {
