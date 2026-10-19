@@ -8,7 +8,7 @@ kept so the build can be reproduced and the config shape stays documented.
 | File | Notes |
 |---|---|
 | `sample-config.redacted.conf` | **Read this one.** The real config shape with all key material masked. |
-| `myst0.conf` | The live config, private key included. Ephemeral — dies when the device slot is freed. |
+| `myst0.conf` | The live config, private key included. Ephemeral — died when the device slot was freed. |
 | `wg-keypair.json` | The Curve25519 keypair, generated locally. Private key included. |
 
 ## What is deliberately NOT here
@@ -34,5 +34,10 @@ a long-lived identity — it is a per-connection credential.
 
 Note this is *not* true of the account token, which is why the two were split.
 
-**If this repo is ever made public, or a collaborator is added, revoke the connection
-first.** Replacing the key costs one `POST /connection/connect`.
+**Status:** the connection was revoked with `GET /connection/disconnect` on
+2026-10-19, immediately before this repository was made public. The key material
+below is kept only as a reproduction artifact and no longer grants access.
+
+**If this repo is ever made public again after new captures are added, or a
+collaborator is added, revoke the current connection first.** Replacing the key
+costs one `POST /connection/connect`.
