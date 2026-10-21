@@ -10,20 +10,32 @@ Works on Ubuntu 24.04 against a live account. Version 1.0.0.
 
 ## Install
 
-Build the package, then copy the `.deb` to the Ubuntu PC and **double-click
-it**. Ubuntu opens it in App Center / Software Install; approve the password
-prompt and the app appears in the application menu. No terminal, no group
-changes, and **no log-out**: the service gives its control socket the primary
-group of the person using the desktop, which that person already belongs to.
+The release is a portable archive. Unpack it on the Ubuntu PC and run the
+installer, which needs a terminal and your password once:
 
 ```sh
-./build-deb.sh
-# dist/mysterium-vpn_1.0.0_amd64.deb
+sudo apt install -y wireguard-tools nftables iproute2 pkexec
+tar xzf mysterium-vpn-linux-amd64.tar.gz
+cd mysterium-vpn-linux-amd64
+sudo ./install.sh
 ```
 
-`./build-portable-package.sh` additionally produces
-`dist/mysterium-vpn-linux-amd64.zip`, which carries the same `.deb` plus a
-portable `install.sh` for machines where the package manager will not be used.
+It installs the daemon, launcher and desktop entry under `/usr/local`, then
+starts `mystd.service`. The service gives its control socket the primary group
+of the person using the desktop, which that person already belongs to, so
+there are no group changes and **no log-out**. Open **Mysterium VPN** from the
+application menu.
+
+To build the archive yourself:
+
+```sh
+./build-portable-package.sh
+# dist/mysterium-vpn-linux-amd64.tar.gz (and .zip)
+```
+
+There is no `.deb` in the release on purpose: a package and a portable install
+place the systemd unit in different directories, and a leftover copy in `/etc`
+silently shadows the package's unit, so upgrades stop taking effect.
 
 The first launch opens a login screen: enter the email address of your
 Mysterium VPN account, click Continue, open the email, then click **Paste** and
@@ -207,7 +219,7 @@ without restarting the service. Click **Start VPN service** in the app (or run
 `sudo systemctl restart mystd`); the launcher re-reads the active user's primary
 group on every start. Check the socket with `ls -l /run/mystd/mystd.sock` and
 the launcher's choice with
-`sudo /usr/lib/mysterium-vpn/desktop-group`.
+`sudo /usr/local/lib/mysterium-vpn/desktop-group`.
 
 **The daemon will not start after you edited the unit.** Almost always a stale
 binary. The unit file and the binary are installed independently, so it is
@@ -221,9 +233,9 @@ Check with:
 strings /usr/local/bin/mystd | grep <flag>
 ```
 
-**`Connection failed` with `Operation not permitted` from `wg-quick`.** The
-service runs under `NoNewPrivileges=yes`, which conflicts with the AppArmor
-profile Ubuntu attaches to `/usr/bin/wg-quick`. AppArmor refuses the profile
+**`Connection failed` with `Operation not permitted` from `wg-quick`.** The unit
+has `NoNewPrivileges=yes`, which conflicts with the AppArmor profile Ubuntu
+attaches to `/usr/bin/wg-quick`. AppArmor refuses the profile
 transitions to `ip`, `wg`, `nft` and `sysctl` under `no_new_privs`, so
 `wg-quick up` aborts before it creates the interface. The app shows the raw
 stderr, and `journalctl -k` shows the matching denial:
@@ -442,18 +454,12 @@ Check it before installing anything:
 
 ### Install
 
-The supported path is the package, because it is the one that needs no
-terminal on the target machine:
+Build the release archive, unpack it, and run the installer:
 
 ```sh
-./build-deb.sh                       # dist/mysterium-vpn_1.0.0_amd64.deb
-./build-portable-package.sh          # also writes the zip with install.sh
-```
-
-The portable installer, for a machine where the `.deb` route is unavailable:
-
-```sh
-sudo ./install.sh
+./build-portable-package.sh          # dist/mysterium-vpn-linux-amd64.tar.gz
+tar xzf dist/mysterium-vpn-linux-amd64.tar.gz -C /tmp
+sudo /tmp/mysterium-vpn-linux-amd64/install.sh
 ```
 
 It installs the daemon, the launcher wrapper and the desktop entry under
@@ -541,9 +547,9 @@ a working daemon.
 `mystd` logs which of the two it is doing at startup.
 
 The installed service does not hard-code a group. Its launcher
-(`/usr/lib/mysterium-vpn/mystd-launch`, or `/usr/local/lib/...` for the
-portable install) reads the active x11/wayland session's user and passes that
-user's primary group, which they already belong to. That is what removes the
+(`/usr/local/lib/mysterium-vpn/mystd-launch`) reads the active x11/wayland
+session's user and passes that user's primary group, which they already belong
+to. That is what removes the
 log-out step from installation. An administrator can override the choice by
 writing a group name to `/etc/mysterium-vpn/socket-group`.
 

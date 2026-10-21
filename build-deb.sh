@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Build the installable Debian package.
+# Legacy: build a Debian package.
 #
-# The .deb is the no-terminal install path: double-click it in Files, approve
-# the password prompt, and Mysterium VPN appears in the application menu with
-# its service already running. No terminal, no usermod, no log-out.
+# Releases no longer ship a .deb; ./build-portable-package.sh produces the
+# supported artifact. A .deb and the portable installer put their systemd
+# units in different directories, and a leftover /etc unit silently shadows
+# the package's, so mixing the two installs makes upgrades stop taking effect.
+# This script is kept for people who still want a package; install.sh refuses
+# to run while one is installed.
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

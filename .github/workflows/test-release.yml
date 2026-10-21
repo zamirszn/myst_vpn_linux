@@ -1,9 +1,9 @@
 name: Test release on clean Ubuntu
 
 # Runs the packaged app on a fresh GitHub-hosted Ubuntu VM: unit tests, the
-# .deb build and install, the daemon over its control socket, and the GTK
-# window under Xvfb. A real tunnel needs a Mysterium account, so that part is
-# deliberately out of scope.
+# portable archive build and install, the daemon over its control socket, and
+# the GTK window under Xvfb. A real tunnel needs a Mysterium account, so that
+# part is deliberately out of scope.
 #
 # Note: hosted runners do not give a desktop session or a polkit agent. The
 # GUI is therefore probed only after a daemon is started explicitly, and the
@@ -56,25 +56,27 @@ jobs:
           go test ./...
           (cd desktop && go test ./...)
 
-      - name: Build the .deb and portable archives
+      - name: Build the portable release archive
         run: ./build-portable-package.sh
 
-      - name: Install the .deb like a user would
+      - name: Install the portable archive like a user would
         run: |
-          sudo apt-get install -y ./dist/mysterium-vpn_1.0.0_amd64.deb
-          test -x /usr/bin/myst-gui
-          test -x /usr/lib/mysterium-vpn/mystd
-          test -f /usr/lib/systemd/system/mystd.service
-          test -f /usr/share/applications/mysterium-vpn.desktop
-          desktop-file-validate /usr/share/applications/mysterium-vpn.desktop
-          dpkg -s mysterium-vpn | grep -E '^(Status|Version)'
+          sudo ./dist/mysterium-vpn-linux-amd64/install.sh
+          test -x /usr/local/bin/myst-gui
+          test -x /usr/local/bin/mystd
+          test -f /etc/systemd/system/mystd.service
+          test -f /usr/local/share/applications/mysterium-vpn.desktop
+          desktop-file-validate /usr/local/share/applications/mysterium-vpn.desktop
+          systemctl is-enabled mystd
+          systemctl show mystd -p NoNewPrivileges | grep -qx 'NoNewPrivileges=no'
           echo '--- installed files ---'
-          dpkg -L mysterium-vpn | sort
+          ls -l /usr/local/bin/mystd /usr/local/bin/myst-gui \
+            /usr/local/lib/mysterium-vpn /etc/systemd/system/mystd.service
 
       - name: Validate the systemd unit
         run: |
           if command -v systemd-analyze >/dev/null 2>&1; then
-            systemd-analyze verify /usr/lib/systemd/system/mystd.service || true
+            systemd-analyze verify /etc/systemd/system/mystd.service || true
           fi
 
       - name: Build the single-binary CLI
@@ -91,7 +93,7 @@ jobs:
           # it the socket group. Never point it at /tmp: that would strip the
           # runner's ability to create temp files in later steps.
           sudo mkdir -p "$SOCKET_DIR"
-          sudo /usr/lib/mysterium-vpn/mystd \
+          sudo /usr/local/bin/mystd \
             -socket "$SOCKET" -socket-group "$GROUP" >/tmp/mystd.log 2>&1 &
           for _ in $(seq 1 50); do
             [ -S "$SOCKET" ] && break
@@ -123,7 +125,7 @@ jobs:
           # pkexec repair path, which needs a polkit agent this runner does not
           # have; the window would still open, but only after a 30s timeout.
           sudo mkdir -p /run/mystd
-          sudo /usr/lib/mysterium-vpn/mystd \
+          sudo /usr/local/bin/mystd \
             -socket /run/mystd/mystd.sock -socket-group "$(id -gn)" \
             >/tmp/mystd-gui.log 2>&1 &
           for _ in $(seq 1 50); do
@@ -131,7 +133,7 @@ jobs:
             sleep 0.2
           done
 
-          dbus-run-session -- /usr/bin/myst-gui >/tmp/gui.log 2>&1 &
+          dbus-run-session -- /usr/local/bin/myst-gui >/tmp/gui.log 2>&1 &
           GUI_JOB=$!
 
           FOUND=""
@@ -163,12 +165,12 @@ jobs:
           pkill -f myst-gui || true
           kill "$GUI_JOB" 2>/dev/null || true
 
-      - name: Upload the package and screenshot
+      - name: Upload the archive and screenshot
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mysterium-vpn-ubuntu-test
           path: |
-            dist/mysterium-vpn_1.0.0_amd64.deb
+            dist/mysterium-vpn-linux-amd64.tar.gz
             dist/mysterium-gui.png
           if-no-files-found: warn

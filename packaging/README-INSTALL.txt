@@ -1,40 +1,50 @@
-MYSTERIUM VPN — UBUNTU INSTALLATION (NO TERMINAL NEEDED)
-=========================================================
+MYSTERIUM VPN — UBUNTU INSTALLATION
+===================================
 
 This folder contains the Mysterium VPN desktop app for 64-bit Ubuntu.
-The recommended way to install it is the .deb package.
+Install it with the included `install.sh`.
+
+
+WHAT YOU NEED
+-------------
+A terminal and the runtime packages:
+
+    sudo apt install -y wireguard-tools nftables iproute2 pkexec
 
 
 WHAT TO DO
 ----------
-1. Copy `mysterium-vpn_1.0.0_amd64.deb` to the other Ubuntu PC.
+1. Extract the archive, if you have not already:
 
-2. Double-click the .deb file.
-   Ubuntu opens it in App Center (or "Software Install" on older releases).
-   If double-click opens the archive viewer instead, right-click the file,
-   choose "Open With", and pick App Center / Software Install.
+       tar xzf mysterium-vpn-linux-amd64.tar.gz
 
-3. Click Install, then enter your normal login password when asked.
+2. Run the installer from inside the extracted folder:
 
-4. Open "Mysterium VPN" from the application grid.
+       cd mysterium-vpn-linux-amd64
+       sudo ./install.sh
 
-5. Log in with the email address of your Mysterium VPN account:
+   Enter your normal login password when asked.
+
+3. Open "Mysterium VPN" from the application grid.
+
+4. Log in with the email address of your Mysterium VPN account:
    - Type your email and click Continue.
    - Open the email on the same computer or your phone.
    - Copy the login link.
    - Back in the app, click Paste and then Log in.
 
-You do not need to log out, restart, add groups, or use a terminal.
+You do not need to log out, restart, or add groups.
 The installer starts the VPN service automatically.
 
 
 WHAT GETS INSTALLED
 -------------------
-  /usr/bin/myst-gui                     the desktop app
-  /usr/lib/mysterium-vpn/mystd          the privileged VPN service
-  /usr/lib/systemd/system/mystd.service the boot service
-  /usr/share/applications/...           the application-menu entry
-  /usr/share/icons/hicolor/...          the app icon
+  /usr/local/bin/myst-gui                          the desktop app
+  /usr/local/bin/mystd                             the privileged VPN service
+  /usr/local/lib/mysterium-vpn/                    launcher and helpers
+  /etc/systemd/system/mystd.service                the boot service
+  /usr/local/share/applications/...                the application-menu entry
+  /usr/local/share/icons/hicolor/...               the app icon
 
 Account credentials are kept by the service in /var/lib/mystd.
 
@@ -45,24 +55,29 @@ Click "Start VPN service" in the app and enter your password.
 The app asks the system to start its own service; you do not need a terminal.
 
 
-IF YOU PREFER THE PORTABLE ARCHIVE
-----------------------------------
-The zip also contains `install.sh` for systems without a Debian package
-manager. That path does use a terminal:
+IF CONNECTING SAYS "Operation not permitted"
+--------------------------------------------
+The service log will show wg-quick failing on /usr/bin/ip. That is the
+NoNewPrivileges option in mystd.service colliding with Ubuntu's AppArmor
+profile for wg-quick; it must be off. If you edited the unit yourself, remove
+that line and run:
 
-    sudo ./install.sh
+    sudo systemctl daemon-reload
+    sudo systemctl restart mystd
 
-It installs to /usr/local and starts the same service.
+Check the result with:
+
+    systemctl show mystd -p NoNewPrivileges     # prints NoNewPrivileges=no
 
 
 UNINSTALL
 ---------
-Remove "Mysterium VPN" from App Center / Software, or run:
+From the extracted folder:
 
-    sudo apt remove mysterium-vpn
+    sudo ./uninstall.sh
 
 Removing keeps /var/lib/mystd so a reinstall does not force a new login.
-"sudo apt purge mysterium-vpn" also deletes the saved login and local settings.
+Delete /var/lib/mystd manually only if you want to remove the saved login.
 
 
 TROUBLESHOOTING
@@ -74,6 +89,5 @@ TROUBLESHOOTING
   restart the VPN service from the app's "Start VPN service" button. The
   service re-reads which user is at the desktop each time it starts.
 
-- WireGuard, nftables, iproute2 and pkexec are installed automatically as
-  package dependencies. The app will not work on a non-systemd distribution
-  without adapting mystd.service.
+- The app will not work on a non-systemd distribution without adapting
+  mystd.service.

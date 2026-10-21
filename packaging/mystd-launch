@@ -35,10 +35,12 @@ if [ -z "$GROUP" ]; then
 	exit 1
 fi
 
-# The daemon may be in the package's private directory (.deb) or the system path
-# (portable install). Pick whichever exists.
+# The daemon lives next to this launcher in the archive and in the old .deb,
+# and in /usr/local/bin for a portable install. Prefer the copy beside the
+# launcher, then the portable path; /usr/lib comes last so a leftover from an
+# old .deb cannot take over a portable install.
 DAEMON=""
-for candidate in "$SELF_DIR/mystd" /usr/lib/mysterium-vpn/mystd /usr/local/bin/mystd /usr/bin/mystd; do
+for candidate in "$SELF_DIR/mystd" /usr/local/bin/mystd /usr/bin/mystd /usr/lib/mysterium-vpn/mystd; do
 	if [ -x "$candidate" ]; then
 		DAEMON=$candidate
 		break

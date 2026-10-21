@@ -1,20 +1,46 @@
 #!/usr/bin/env bash
-# Build everything that goes on the other machine: the double-click .deb, and a
-# portable archive for systems where the package manager will not be used.
+# Build the release artifacts: a portable archive containing the daemon, the
+# GTK app, the launcher, and install.sh.
+#
+# This is the only installer the release ships. There is deliberately no .deb:
+# the package and the portable installer put their systemd units in different
+# directories (/usr/lib and /etc), and when both have been used the /etc copy
+# shadows the package's, so package upgrades silently stop taking effect.
 set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DIST="$ROOT_DIR/dist"
 VERSION="${VERSION:-1.0.0}"
 ARCH="${ARCH:-$(dpkg --print-architecture)}"
 STAGE="$DIST/mysterium-vpn-linux-${ARCH}"
+BIN_DIR="$DIST/bin"
 
-# Builds dist/bin/{mystd,myst-gui} and dist/mysterium-vpn_<version>_<arch>.deb.
-VERSION="$VERSION" ARCH="$ARCH" "$ROOT_DIR/build-deb.sh"
+if ! command -v go >/dev/null 2>&1; then
+  echo 'ERROR: Go is required to build the package.' >&2
+  exit 1
+fi
+if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists gtk4; then
+  echo 'ERROR: GTK 4 development files are missing.' >&2
+  echo 'On Ubuntu/Debian: sudo apt update && sudo apt install -y build-essential pkg-config libgtk-4-dev gobject-introspection' >&2
+  exit 1
+fi
+
+export CGO_ENABLED=1
+mkdir -p "$BIN_DIR"
+
+printf '\n==> Building the daemon\n'
+(cd "$ROOT_DIR" && go build -buildvcs=false -trimpath \
+  -ldflags "-s -w" \
+  -o "$BIN_DIR/mystd" ./cmd/mystd)
+
+printf '\n==> Building the GTK app\n'
+(cd "$ROOT_DIR/desktop" && go build -buildvcs=false -trimpath \
+  -ldflags "-s -w -X main.version=$VERSION" \
+  -o "$BIN_DIR/myst-gui" ./cmd/myst-gui)
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/icons"
-install -m 0755 "$DIST/bin/mystd" "$STAGE/mystd"
-install -m 0755 "$DIST/bin/myst-gui" "$STAGE/myst-gui"
+install -m 0755 "$BIN_DIR/mystd" "$STAGE/mystd"
+install -m 0755 "$BIN_DIR/myst-gui" "$STAGE/myst-gui"
 install -m 0755 "$ROOT_DIR/packaging/mystd-launch" "$STAGE/mystd-launch"
 install -m 0755 "$ROOT_DIR/packaging/desktop-group" "$STAGE/desktop-group"
 install -m 0755 "$ROOT_DIR/packaging/install.sh" "$STAGE/install.sh"
@@ -28,9 +54,6 @@ for size in 48 64 128 256 512; do
     "$STAGE/icons/mysterium-vpn-${size}.png"
 done
 
-# The recommended, terminal-free installer travels in the same archive.
-cp "$DIST/mysterium-vpn_${VERSION}_${ARCH}.deb" "$STAGE/"
-
 file "$STAGE/mystd" "$STAGE/myst-gui"
 chmod 0755 "$STAGE/mystd" "$STAGE/myst-gui"
 mkdir -p "$DIST"
@@ -43,7 +66,8 @@ else
 fi
 
 printf '\nCreated:\n'
-printf '  %s\n' "$DIST/mysterium-vpn_${VERSION}_${ARCH}.deb"
 printf '  %s\n' "$DIST/mysterium-vpn-linux-${ARCH}.tar.gz"
 [[ ! -f "$DIST/mysterium-vpn-linux-${ARCH}.zip" ]] || printf '  %s\n' "$DIST/mysterium-vpn-linux-${ARCH}.zip"
-printf '\nSend the .deb to the other Ubuntu PC and double-click it.\n'
+printf '\nOn the other Ubuntu PC:\n'
+printf '  tar xzf mysterium-vpn-linux-%s.tar.gz\n' "$ARCH"
+printf '  cd mysterium-vpn-linux-%s && sudo ./install.sh\n' "$ARCH"
