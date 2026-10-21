@@ -2,10 +2,10 @@
 # Build the release artifacts: a portable archive containing the daemon, the
 # GTK app, the launcher, and install.sh.
 #
-# This is the only installer the release ships. There is deliberately no .deb:
-# the package and the portable installer put their systemd units in different
-# directories (/usr/lib and /etc), and when both have been used the /etc copy
-# shadows the package's, so package upgrades silently stop taking effect.
+# This is the only installer in the tree. The .deb packaging was removed
+# because the package and the portable installer put their systemd units in
+# different directories (/usr/lib and /etc); when both have been used the /etc
+# copy shadows the package's, so package upgrades silently stop taking effect.
 set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DIST="$ROOT_DIR/dist"

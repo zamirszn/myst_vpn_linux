@@ -29,9 +29,9 @@ icons, `install.sh`, and `uninstall.sh`. The script fails immediately if GTK 4
 development files are missing or either build fails; it never ships a stale GUI
 binary.
 
-The release deliberately does not contain a `.deb`. A Debian package and the
-portable installer put the systemd unit in different directories (`/usr/lib`
-and `/etc`), and systemd prefers the `/etc` copy. Once both installs have been
+The Debian packaging has been deliberately removed. A `.deb` and the portable
+installer put the systemd unit in different directories (`/usr/lib` and
+`/etc`), and systemd prefers the `/etc` copy. Once both installs have been
 used, the leftover unit silently takes over and package upgrades stop having
 any effect.
 

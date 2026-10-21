@@ -13,10 +13,11 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-# The .deb installs the same service under /usr/lib/systemd/system; this script
-# installs it under /etc, where it shadows the package's copy. Both cannot be
-# in charge at once, and when both are, package upgrades silently stop taking
-# effect. Refuse to mix the two install methods.
+# An older .deb release installed the same service under
+# /usr/lib/systemd/system; this script installs it under /etc, where it
+# shadows the package's copy. Both cannot be in charge at once, and when both
+# are, package upgrades silently stop taking effect. Refuse to mix the two
+# install methods.
 if command -v dpkg-query >/dev/null 2>&1 &&
    [[ "$(dpkg-query -W -f='${db:Status-Status}' mysterium-vpn 2>/dev/null)" == installed ]]; then
   echo "The mysterium-vpn package is installed; use it instead of this archive." >&2

@@ -33,9 +33,12 @@ To build the archive yourself:
 # dist/mysterium-vpn-linux-amd64.tar.gz (and .zip)
 ```
 
-There is no `.deb` in the release on purpose: a package and a portable install
+The Debian packaging has been removed on purpose: a `.deb` and this installer
 place the systemd unit in different directories, and a leftover copy in `/etc`
-silently shadows the package's unit, so upgrades stop taking effect.
+silently shadows the package's unit, so upgrades stop taking effect. If an
+earlier release left `mysterium-vpn` installed, remove it with
+`sudo apt remove mysterium-vpn` before installing this archive; the saved login
+in `/var/lib/mystd` survives.
 
 The first launch opens a login screen: enter the email address of your
 Mysterium VPN account, click Continue, open the email, then click **Paste** and
