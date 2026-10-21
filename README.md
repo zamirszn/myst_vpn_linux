@@ -221,6 +221,28 @@ Check with:
 strings /usr/local/bin/mystd | grep <flag>
 ```
 
+**`Connection failed` with `Operation not permitted` from `wg-quick`.** The
+service runs under `NoNewPrivileges=yes`, which conflicts with the AppArmor
+profile Ubuntu attaches to `/usr/bin/wg-quick`. AppArmor refuses the profile
+transitions to `ip`, `wg`, `nft` and `sysctl` under `no_new_privs`, so
+`wg-quick up` aborts before it creates the interface. The app shows the raw
+stderr, and `journalctl -k` shows the matching denial:
+
+```sh
+sudo journalctl -k | grep 'profile="wg-quick"'
+# apparmor="DENIED" operation="exec" ... info="no new privs" name="/usr/bin/ip"
+```
+
+Remove `NoNewPrivileges=yes` from the unit (the shipped units no longer set it),
+then reload:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart mystd
+```
+
+Confirm with `systemctl show mystd -p NoNewPrivileges` — it must print `no`.
+
 **You are offline and the daemon will not answer.** The kill switch is still
 armed with nothing behind it. This is the failure the monitor exists to prevent,
 but if it happens, the escape hatch is one command:

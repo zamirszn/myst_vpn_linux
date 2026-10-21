@@ -11,7 +11,17 @@ Type=simple
 ExecStart=/usr/lib/mysterium-vpn/mystd-launch
 Restart=on-failure
 RestartSec=5
-NoNewPrivileges=yes
+# NoNewPrivileges=yes must stay OFF. The apparmor package on Ubuntu 23.10+ (and
+# on other distros carrying Canonical's wireguard-tools profiles) attaches a
+# profile to /usr/bin/wg-quick that transitions into child profiles for ip, wg,
+# nft and sysctl. AppArmor treats those transitions as privilege changes and
+# refuses them when no_new_privs is set, so wg-quick dies with:
+#
+#   /usr/bin/wg-quick: line 32: /usr/bin/ip: Operation not permitted
+#
+# and the kernel log shows apparmor="DENIED" ... info="no new privs" with
+# target="wg-quick//ip". The rest of the hardening below is compatible with
+# wg-quick; only no_new_privs conflicts.
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=full
