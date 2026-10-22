@@ -44,13 +44,18 @@ jobs:
             go.sum
             desktop/go.sum
 
-      - name: Install build dependencies (apt cache)
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        with:
-          packages: >-
-            build-essential pkg-config libgtk-4-dev gobject-introspection zip
-          # Bump to force a fresh apt cache after editing the package list.
-          version: 1.0
+      - name: Install build dependencies
+        run: |
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+                 build-essential pkg-config libgtk-4-dev gobject-introspection zip; then
+              break
+            fi
+            echo "apt failed (attempt $attempt), retrying..."
+            sleep 5
+          done
+          # Fail here with a clear message if the headers are still missing.
+          pkg-config --exists gtk4 glib-2.0 gobject-2.0
 
       - name: Run unit tests
         run: |
