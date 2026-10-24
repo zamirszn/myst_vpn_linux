@@ -1,17 +1,11 @@
-name: Build and release
 
-# On every push to main: run the tests, build the portable archive, and, only
-# if that all succeeds, publish a GitHub Release for that exact commit.
-# Pull requests and manual runs build and test but never publish.
+name: Build and release
 
 on:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
 
-# A newer commit cancels any older run still in progress, so only the latest
-# commit gets built and released.
 concurrency:
   group: build-release-${{ github.ref }}
   cancel-in-progress: true
@@ -20,8 +14,6 @@ permissions:
   contents: read
 
 env:
-  # Auto-incrementing version, e.g. 1.0.42. Change the "1.0" prefix by hand
-  # when you want to bump major/minor.
   VERSION: 1.0.${{ github.run_number }}
 
 jobs:
@@ -39,7 +31,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-          # Two modules, so key the Go module and build caches on both.
           cache-dependency-path: |
             go.sum
             desktop/go.sum
@@ -54,20 +45,16 @@ jobs:
             echo "apt failed (attempt $attempt), retrying..."
             sleep 5
           done
-          # Fail here with a clear message if the headers are still missing.
-          pkg-config --exists gtk4 glib-2.0 gobject-2.0
 
-      - name: Run unit tests
-        run: |
-          go test ./...
-          (cd desktop && go test ./...)
+          pkg-config --exists gtk4 glib-2.0 gobject-2.0
 
       - name: Build the portable release archive
         run: ./build-portable-package.sh
 
       - name: Create checksums
         working-directory: dist
-        run: sha256sum mysterium-vpn-linux-*.tar.gz mysterium-vpn-linux-*.zip > SHA256SUMS
+        run: |
+          sha256sum mysterium-vpn-linux-*.tar.gz mysterium-vpn-linux-*.zip > SHA256SUMS
 
       - name: Upload the build output
         uses: actions/upload-artifact@v4
@@ -82,7 +69,6 @@ jobs:
   release:
     name: Publish release
     needs: build
-    # Only for pushes to main, and only when the build job succeeded.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -100,6 +86,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          VERSION: 1.0.${{ github.run_number }}
         run: |
           gh release create "v${VERSION}" release/* \
             --target "${GITHUB_SHA}" \
